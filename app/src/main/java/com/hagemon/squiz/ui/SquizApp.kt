@@ -1,8 +1,15 @@
 package com.hagemon.squiz.ui
 
+import android.app.DownloadManager
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.net.Uri
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedContentTransitionScope
 import androidx.compose.animation.core.tween
@@ -24,8 +31,12 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -36,9 +47,15 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.core.content.ContextCompat
 import com.hagemon.squiz.data.SquizRepository
 import com.hagemon.squiz.data.excel.ExcelAnalyzer
 import com.hagemon.squiz.data.excel.ExcelWorkbookReader
+import com.hagemon.squiz.data.update.AppUpdateInfo
+import com.hagemon.squiz.data.update.AppUpdateManager
+import com.hagemon.squiz.data.update.DownloadedUpdate
+import com.hagemon.squiz.data.update.UpdateCheckResult
+import com.hagemon.squiz.data.update.UpdateDownloadStatus
 import com.hagemon.squiz.model.AppSettings
 import com.hagemon.squiz.model.ImportAnalysis
 import com.hagemon.squiz.model.LibraryItem
@@ -60,6 +77,8 @@ import com.hagemon.squiz.ui.screens.QuizScreen
 import com.hagemon.squiz.ui.screens.QuizSettingsScreen
 import com.hagemon.squiz.ui.screens.SettingsScreen
 import com.hagemon.squiz.ui.screens.ThemeSettingsScreen
+import com.hagemon.squiz.ui.components.AvailableUpdateDialog
+import com.hagemon.squiz.ui.components.DownloadedUpdateDialog
 import kotlinx.coroutines.launch
 
 private enum class Destination {
@@ -117,10 +136,125 @@ fun SquizApp(
     var quizReturnDestination by remember { mutableStateOf(Destination.QUESTION_BANK) }
     var speedDialScrim by remember { mutableStateOf(false) }
     var busy by remember { mutableStateOf(false) }
+    val updateManager = remember(context.applicationContext) { AppUpdateManager(context) }
+    val snackbarHostState = remember { SnackbarHostState() }
+    var availableUpdate by remember { mutableStateOf<AppUpdateInfo?>(null) }
+    var downloadedUpdate by remember { mutableStateOf<DownloadedUpdate?>(null) }
+    var installAfterPermission by remember { mutableStateOf<DownloadedUpdate?>(null) }
+    var isCheckingForUpdate by remember { mutableStateOf(false) }
+    var isDownloadingUpdate by remember { mutableStateOf(false) }
     val showNavigationBar = destination == Destination.LIBRARY || destination == Destination.SETTINGS
+
+    val unknownSourcesLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult(),
+    ) {
+        val update = installAfterPermission
+        if (update != null && updateManager.canRequestPackageInstalls()) {
+            context.startActivity(updateManager.installIntent(update.file))
+            installAfterPermission = null
+        } else if (update != null) {
+            scope.launch { snackbarHostState.showSnackbar("需要允许 Squiz 安装未知应用") }
+        }
+    }
 
     fun message(text: String) {
         Toast.makeText(context, text, Toast.LENGTH_SHORT).show()
+    }
+
+    fun showDownloadStatus(status: UpdateDownloadStatus, notifyFailure: Boolean = true) {
+        when (status) {
+            UpdateDownloadStatus.None -> isDownloadingUpdate = false
+            UpdateDownloadStatus.Downloading -> isDownloadingUpdate = true
+            is UpdateDownloadStatus.Ready -> {
+                isDownloadingUpdate = false
+                availableUpdate = null
+                downloadedUpdate = status.update
+            }
+            is UpdateDownloadStatus.Failure -> {
+                isDownloadingUpdate = false
+                if (notifyFailure) {
+                    scope.launch { snackbarHostState.showSnackbar(status.message) }
+                }
+            }
+        }
+    }
+
+    fun checkForUpdates(manual: Boolean) {
+        if (isCheckingForUpdate) return
+        scope.launch {
+            if (manual) {
+                when (val pending = updateManager.inspectPendingDownload()) {
+                    is UpdateDownloadStatus.Ready -> {
+                        showDownloadStatus(pending)
+                        return@launch
+                    }
+                    UpdateDownloadStatus.Downloading -> {
+                        showDownloadStatus(pending)
+                        snackbarHostState.showSnackbar("更新正在后台下载")
+                        return@launch
+                    }
+                    else -> showDownloadStatus(pending, notifyFailure = false)
+                }
+            }
+
+            isCheckingForUpdate = true
+            when (val result = updateManager.checkForUpdate(force = manual)) {
+                is UpdateCheckResult.Available -> availableUpdate = result.info
+                UpdateCheckResult.UpToDate -> if (manual) snackbarHostState.showSnackbar("已是最新版本")
+                UpdateCheckResult.NoPublishedRelease -> if (manual) snackbarHostState.showSnackbar("暂时没有已发布的版本")
+                UpdateCheckResult.Skipped -> Unit
+                is UpdateCheckResult.Failure -> if (manual) snackbarHostState.showSnackbar(result.message)
+            }
+            isCheckingForUpdate = false
+        }
+    }
+
+    fun downloadUpdate(info: AppUpdateInfo) {
+        availableUpdate = null
+        runCatching { updateManager.enqueueDownload(info) }
+            .onSuccess {
+                isDownloadingUpdate = true
+                scope.launch { snackbarHostState.showSnackbar("已开始后台下载更新") }
+            }
+            .onFailure { error ->
+                scope.launch { snackbarHostState.showSnackbar(error.message ?: "无法开始下载") }
+            }
+    }
+
+    fun installUpdate(update: DownloadedUpdate) {
+        downloadedUpdate = null
+        if (updateManager.canRequestPackageInstalls()) {
+            context.startActivity(updateManager.installIntent(update.file))
+        } else {
+            installAfterPermission = update
+            unknownSourcesLauncher.launch(updateManager.unknownSourcesSettingsIntent())
+        }
+    }
+
+    LaunchedEffect(updateManager) {
+        val pending = updateManager.inspectPendingDownload()
+        showDownloadStatus(pending)
+        if (pending == UpdateDownloadStatus.None || pending is UpdateDownloadStatus.Failure) {
+            checkForUpdates(manual = false)
+        }
+    }
+
+    DisposableEffect(updateManager) {
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(receivedContext: Context?, intent: Intent?) {
+                val downloadId = intent?.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1L) ?: -1L
+                if (updateManager.isPendingDownload(downloadId)) {
+                    scope.launch { showDownloadStatus(updateManager.inspectPendingDownload()) }
+                }
+            }
+        }
+        ContextCompat.registerReceiver(
+            context,
+            receiver,
+            IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE),
+            ContextCompat.RECEIVER_EXPORTED,
+        )
+        onDispose { context.unregisterReceiver(receiver) }
     }
 
     fun leaveImport() {
@@ -255,6 +389,7 @@ fun SquizApp(
             modifier = Modifier.fillMaxSize(),
             containerColor = MaterialTheme.colorScheme.background,
             contentWindowInsets = WindowInsets(0),
+            snackbarHost = { SnackbarHost(snackbarHostState) },
             bottomBar = {
                 if (showNavigationBar) {
                     Box {
@@ -323,8 +458,12 @@ fun SquizApp(
                     )
                     Destination.SETTINGS -> SettingsScreen(
                         outerPadding = contentPadding,
+                        currentVersion = updateManager.currentVersionName,
+                        isCheckingForUpdate = isCheckingForUpdate,
+                        isDownloadingUpdate = isDownloadingUpdate,
                         onThemeClick = { destination = Destination.THEME },
                         onQuizSettingsClick = { destination = Destination.QUIZ_SETTINGS },
+                        onCheckForUpdate = { checkForUpdates(manual = true) },
                     )
                     Destination.THEME -> ThemeSettingsScreen(
                         settings = settings,
@@ -479,6 +618,20 @@ fun SquizApp(
             ) {
                 CircularProgressIndicator()
             }
+        }
+        availableUpdate?.let { update ->
+            AvailableUpdateDialog(
+                info = update,
+                onDismiss = { availableUpdate = null },
+                onDownload = { downloadUpdate(update) },
+            )
+        }
+        downloadedUpdate?.let { update ->
+            DownloadedUpdateDialog(
+                update = update,
+                onDismiss = { downloadedUpdate = null },
+                onInstall = { installUpdate(update) },
+            )
         }
     }
 }

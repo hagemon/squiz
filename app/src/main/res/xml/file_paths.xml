@@ -3,4 +3,7 @@
     <cache-path
         name="shared_question_banks"
         path="shared_question_banks/" />
+    <external-files-path
+        name="app_updates"
+        path="Download/updates/" />
 </paths>

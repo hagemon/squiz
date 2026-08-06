@@ -11,7 +11,9 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowForwardIos
 import androidx.compose.material.icons.rounded.Palette
+import androidx.compose.material.icons.rounded.SystemUpdate
 import androidx.compose.material.icons.rounded.Tune
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ListItem
@@ -31,8 +33,12 @@ import androidx.compose.ui.unit.dp
 @Composable
 fun SettingsScreen(
     outerPadding: PaddingValues,
+    currentVersion: String,
+    isCheckingForUpdate: Boolean,
+    isDownloadingUpdate: Boolean,
     onThemeClick: () -> Unit,
     onQuizSettingsClick: () -> Unit,
+    onCheckForUpdate: () -> Unit,
 ) {
     Scaffold(
         modifier = Modifier
@@ -74,7 +80,22 @@ fun SettingsScreen(
                 subtitle = "答题与自动翻页",
                 onClick = onQuizSettingsClick,
             )
-
+            Text(
+                text = "关于",
+                modifier = Modifier.padding(start = 12.dp, top = 24.dp, bottom = 8.dp),
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.primary,
+                fontWeight = FontWeight.SemiBold,
+            )
+            SettingsEntry(
+                icon = Icons.Rounded.SystemUpdate,
+                title = "检查更新",
+                subtitle = if (isDownloadingUpdate) "正在后台下载 · 当前版本 $currentVersion" else "当前版本 $currentVersion",
+                loading = isCheckingForUpdate,
+                enabled = !isCheckingForUpdate,
+                showArrow = false,
+                onClick = onCheckForUpdate,
+            )
         }
     }
 }
@@ -84,12 +105,15 @@ private fun SettingsEntry(
     icon: ImageVector,
     title: String,
     subtitle: String,
+    loading: Boolean = false,
+    enabled: Boolean = true,
+    showArrow: Boolean = true,
     onClick: () -> Unit,
 ) {
     ListItem(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(onClick = onClick),
+            .clickable(enabled = enabled, onClick = onClick),
         colors = ListItemDefaults.colors(containerColor = androidx.compose.ui.graphics.Color.Transparent),
         headlineContent = { Text(title, fontWeight = FontWeight.Medium) },
         supportingContent = { Text(subtitle) },
@@ -102,12 +126,16 @@ private fun SettingsEntry(
             )
         },
         trailingContent = {
-            Icon(
-                Icons.AutoMirrored.Rounded.ArrowForwardIos,
-                contentDescription = null,
-                modifier = Modifier.size(16.dp),
-                tint = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+            if (loading) {
+                CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+            } else if (showArrow) {
+                Icon(
+                    Icons.AutoMirrored.Rounded.ArrowForwardIos,
+                    contentDescription = null,
+                    modifier = Modifier.size(16.dp),
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
         },
     )
 }
