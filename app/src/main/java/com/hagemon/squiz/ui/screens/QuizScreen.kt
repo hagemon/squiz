@@ -20,6 +20,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.pager.HorizontalPager
@@ -39,6 +40,8 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.LocalMinimumInteractiveComponentSize
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
@@ -49,6 +52,7 @@ import androidx.compose.material3.TextField
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateMapOf
@@ -58,6 +62,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.layout.Layout
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
@@ -130,6 +135,16 @@ fun QuizScreen(
     val safeInitialPage = initialPage.coerceIn(0, (totalQuestionCount - 1).coerceAtLeast(0))
     val pagerState = rememberPagerState(initialPage = safeInitialPage, pageCount = { totalQuestionCount.coerceAtLeast(0) })
     var showQuestionNavigator by remember { mutableStateOf(false) }
+    val navigatorQuestionTypes = remember(initialQuestions, totalQuestionCount) {
+        mutableStateMapOf<Int, QuestionType>().apply {
+            initialQuestions.forEach { question -> put(question.position, question.type) }
+        }
+    }
+    var navigatorTypesLoading by remember { mutableStateOf(false) }
+    var navigatorTypesLoadFinished by remember(initialQuestions, totalQuestionCount) {
+        mutableStateOf(navigatorQuestionTypes.size >= totalQuestionCount)
+    }
+    var navigatorTypesLoadFailed by remember { mutableStateOf(false) }
 
     suspend fun loadChunk(start: Int) {
         val normalizedStart = start.coerceAtLeast(0)
@@ -160,6 +175,30 @@ fun QuizScreen(
         scope.launch {
             if (abs(page - pagerState.currentPage) <= 6) pagerState.animateScrollToPage(page)
             else pagerState.scrollToPage(page)
+        }
+    }
+
+    fun openQuestionNavigator() {
+        showQuestionNavigator = true
+        if (navigatorTypesLoading || navigatorQuestionTypes.size >= totalQuestionCount) return
+        scope.launch {
+            navigatorTypesLoading = true
+            navigatorTypesLoadFinished = false
+            navigatorTypesLoadFailed = false
+            for (start in 0 until totalQuestionCount step questionPageSize) {
+                val end = minOf(start + questionPageSize, totalQuestionCount)
+                if ((start until end).all(navigatorQuestionTypes::containsKey)) continue
+                val pageResult = runCatching { onLoadPage(start, questionPageSize) }
+                if (pageResult.isFailure) {
+                    navigatorTypesLoadFailed = true
+                    break
+                }
+                pageResult.getOrThrow().forEach { question ->
+                    navigatorQuestionTypes[question.position] = question.type
+                }
+            }
+            navigatorTypesLoading = false
+            navigatorTypesLoadFinished = true
         }
     }
 
@@ -198,7 +237,7 @@ fun QuizScreen(
                     }
                 },
                 actions = {
-                    IconButton(onClick = { showQuestionNavigator = true }) {
+                    IconButton(onClick = ::openQuestionNavigator) {
                         Icon(Icons.Rounded.GridView, contentDescription = "题目列表")
                     }
                 },
@@ -250,6 +289,10 @@ fun QuizScreen(
             totalQuestionCount = totalQuestionCount,
             currentPage = pagerState.currentPage,
             statusByPosition = statusByPosition,
+            questionTypeByPosition = navigatorQuestionTypes,
+            typesLoading = navigatorTypesLoading,
+            typesLoadFinished = navigatorTypesLoadFinished,
+            typesLoadFailed = navigatorTypesLoadFailed,
             onDismiss = { showQuestionNavigator = false },
             onQuestionClick = { page ->
                 showQuestionNavigator = false
@@ -295,37 +338,13 @@ private fun QuizQuestionPage(
                 .padding(top = 24.dp, bottom = if (showAction) 112.dp else 32.dp),
             verticalArrangement = Arrangement.spacedBy(18.dp),
         ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text(
-                    question.type.displayName,
-                    modifier = Modifier.weight(1f),
-                    color = MaterialTheme.colorScheme.primary,
-                    fontWeight = FontWeight.SemiBold,
-                )
-                if (showGuessedMark) {
-                    Surface(
-                        onClick = { onGuessedChange(!isGuessed) },
-                        shape = RoundedCornerShape(14.dp),
-                        color = if (isGuessed) Color(0xFFFFE082) else MaterialTheme.colorScheme.surfaceContainer,
-                        contentColor = if (isGuessed) Color(0xFF4A3A00) else MaterialTheme.colorScheme.onSurfaceVariant,
-                        border = BorderStroke(
-                            1.dp,
-                            if (isGuessed) Color(0xFFE1B93F) else MaterialTheme.colorScheme.outlineVariant,
-                        ),
-                    ) {
-                        Text(
-                            text = if (isGuessed) "蒙对了！" else "蒙对了？",
-                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
-                            style = MaterialTheme.typography.labelLarge,
-                            fontWeight = FontWeight.Medium,
-                        )
-                    }
-                }
-            }
-            Text(question.prompt, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Medium)
+            QuestionHeading(
+                type = question.type,
+                prompt = question.prompt,
+                showGuessedMark = showGuessedMark,
+                isGuessed = isGuessed,
+                onGuessedChange = onGuessedChange,
+            )
             Spacer(Modifier.height(2.dp))
             if (isChoice) {
                 question.options.forEach { option ->
@@ -367,20 +386,21 @@ private fun QuizQuestionPage(
                             modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
-                            if (multiple) {
-                                Checkbox(checked = selected, onCheckedChange = null, enabled = !answerState.submitted && !reviewMode)
-                            } else {
-                                RadioButton(selected = selected, onClick = null, enabled = !answerState.submitted && !reviewMode)
-                            }
+                            OptionSelectionControl(
+                                multiple = multiple,
+                                selected = selected,
+                                submitted = answerState.submitted,
+                                correct = option.isCorrect,
+                                reviewMode = reviewMode,
+                                color = foreground,
+                            )
                             Spacer(Modifier.width(8.dp))
-                            Text("${option.label}. ${option.text}", modifier = Modifier.weight(1f), color = foreground)
-                            if (answerState.submitted && (option.isCorrect || selected)) {
-                                Icon(
-                                    if (option.isCorrect) Icons.Rounded.Check else Icons.Rounded.Close,
-                                    contentDescription = null,
-                                    tint = foreground,
-                                )
-                            }
+                            Text(
+                                "${option.label}. ${option.text}",
+                                modifier = Modifier.weight(1f),
+                                color = foreground,
+                                style = MaterialTheme.typography.bodyMedium,
+                            )
                         }
                     }
                 }
@@ -436,12 +456,114 @@ private fun QuizQuestionPage(
     }
 }
 
+@Composable
+private fun OptionSelectionControl(
+    multiple: Boolean,
+    selected: Boolean,
+    submitted: Boolean,
+    correct: Boolean,
+    reviewMode: Boolean,
+    color: Color,
+) {
+    Box(modifier = Modifier.size(48.dp), contentAlignment = Alignment.Center) {
+        if (submitted && (correct || selected)) {
+            Surface(
+                modifier = Modifier.size(24.dp),
+                shape = if (multiple) RoundedCornerShape(5.dp) else CircleShape,
+                color = Color.Transparent,
+                border = BorderStroke(2.dp, color),
+                contentColor = color,
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    Icon(
+                        imageVector = if (correct) Icons.Rounded.Check else Icons.Rounded.Close,
+                        contentDescription = if (correct) "正确选项" else "错误选择",
+                        modifier = Modifier.size(17.dp),
+                        tint = color,
+                    )
+                }
+            }
+        } else if (multiple) {
+            Checkbox(
+                checked = selected,
+                onCheckedChange = null,
+                enabled = !submitted && !reviewMode,
+            )
+        } else {
+            RadioButton(
+                selected = selected,
+                onClick = null,
+                enabled = !submitted && !reviewMode,
+            )
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun QuestionHeading(
+    type: QuestionType,
+    prompt: String,
+    showGuessedMark: Boolean,
+    isGuessed: Boolean,
+    onGuessedChange: (Boolean) -> Unit,
+) {
+    Layout(
+        modifier = Modifier.fillMaxWidth(),
+        content = {
+            Text(
+                type.displayName,
+                color = MaterialTheme.colorScheme.primary,
+                fontWeight = FontWeight.SemiBold,
+            )
+            if (showGuessedMark) {
+                CompositionLocalProvider(LocalMinimumInteractiveComponentSize provides 0.dp) {
+                    Surface(
+                        onClick = { onGuessedChange(!isGuessed) },
+                        shape = RoundedCornerShape(14.dp),
+                        color = if (isGuessed) Color(0xFFFFE082) else MaterialTheme.colorScheme.surfaceContainer,
+                        contentColor = if (isGuessed) Color(0xFF4A3A00) else MaterialTheme.colorScheme.onSurfaceVariant,
+                        border = BorderStroke(
+                            1.dp,
+                            if (isGuessed) Color(0xFFE1B93F) else MaterialTheme.colorScheme.outlineVariant,
+                        ),
+                    ) {
+                        Text(
+                            text = if (isGuessed) "蒙对了！" else "蒙对了？",
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
+                            style = MaterialTheme.typography.labelLarge,
+                            fontWeight = FontWeight.Medium,
+                        )
+                    }
+                }
+            }
+            Text(prompt, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Medium)
+        },
+    ) { measurables, constraints ->
+        val looseConstraints = constraints.copy(minWidth = 0, minHeight = 0)
+        val typePlaceable = measurables.first().measure(looseConstraints)
+        val promptPlaceable = measurables.last().measure(looseConstraints)
+        val guessedPlaceable = if (showGuessedMark) measurables[1].measure(looseConstraints) else null
+        val width = constraints.maxWidth
+        val promptY = typePlaceable.height + 18.dp.roundToPx()
+        layout(width, promptY + promptPlaceable.height) {
+            typePlaceable.placeRelative(0, 0)
+            guessedPlaceable?.placeRelative(width - guessedPlaceable.width, 0)
+            promptPlaceable.placeRelative(0, promptY)
+        }
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun QuestionNavigatorDialog(
     totalQuestionCount: Int,
     currentPage: Int,
     statusByPosition: Map<Int, QuestionAnswerStatus>,
+    questionTypeByPosition: Map<Int, QuestionType>,
+    typesLoading: Boolean,
+    typesLoadFinished: Boolean,
+    typesLoadFailed: Boolean,
     onDismiss: () -> Unit,
     onQuestionClick: (Int) -> Unit,
 ) {
@@ -482,35 +604,109 @@ private fun QuestionNavigatorDialog(
                         NavigatorLegend("答错", MaterialTheme.colorScheme.error)
                         NavigatorLegend("未答", MaterialTheme.colorScheme.surfaceVariant)
                     }
-                    LazyVerticalGrid(
-                        columns = GridCells.Adaptive(50.dp),
-                        modifier = Modifier.fillMaxSize(),
-                        contentPadding = PaddingValues(start = 18.dp, top = 6.dp, end = 18.dp, bottom = 28.dp),
-                        horizontalArrangement = Arrangement.spacedBy(10.dp),
-                        verticalArrangement = Arrangement.spacedBy(10.dp),
-                    ) {
-                        items(totalQuestionCount) { page ->
-                            val status = statusByPosition[page]
-                            val container = when (status) {
-                                QuestionAnswerStatus.CORRECT -> MaterialTheme.colorScheme.primary
-                                QuestionAnswerStatus.INCORRECT -> MaterialTheme.colorScheme.error
-                                null -> MaterialTheme.colorScheme.surfaceVariant
+                    if (!typesLoadFinished) {
+                        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                CircularProgressIndicator()
+                                Spacer(Modifier.height(12.dp))
+                                Text(
+                                    if (typesLoading) "正在整理题型…" else "正在准备题目列表…",
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
                             }
-                            val content = when (status) {
-                                QuestionAnswerStatus.CORRECT -> MaterialTheme.colorScheme.onPrimary
-                                QuestionAnswerStatus.INCORRECT -> MaterialTheme.colorScheme.onError
-                                null -> MaterialTheme.colorScheme.onSurfaceVariant
+                        }
+                    } else {
+                        if (typesLoadFailed) {
+                            Text(
+                                "部分题型信息加载失败，已归入“未指定”。",
+                                modifier = Modifier.padding(horizontal = 18.dp, vertical = 4.dp),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.error,
+                            )
+                        }
+                        val groupedPages = QuestionType.entries
+                            .sortedBy { it.navigatorOrder }
+                            .mapNotNull { type ->
+                                (0 until totalQuestionCount)
+                                    .filter { page -> (questionTypeByPosition[page] ?: QuestionType.UNKNOWN) == type }
+                                    .takeIf(List<Int>::isNotEmpty)
+                                    ?.let { type to it }
                             }
-                            Surface(
-                                onClick = { onQuestionClick(page) },
-                                modifier = Modifier.aspectRatio(1f),
-                                shape = RoundedCornerShape(14.dp),
-                                color = container,
-                                contentColor = content,
-                                border = if (page == currentPage) BorderStroke(2.dp, MaterialTheme.colorScheme.onSurface) else null,
-                            ) {
-                                Box(contentAlignment = Alignment.Center) {
-                                    Text("${page + 1}", fontWeight = if (page == currentPage) FontWeight.Bold else FontWeight.Medium)
+                        LazyVerticalGrid(
+                            columns = GridCells.Adaptive(50.dp),
+                            modifier = Modifier.fillMaxSize(),
+                            contentPadding = PaddingValues(start = 18.dp, top = 2.dp, end = 18.dp, bottom = 28.dp),
+                            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                            verticalArrangement = Arrangement.spacedBy(10.dp),
+                        ) {
+                            groupedPages.forEachIndexed { groupIndex, (type, pages) ->
+                                item(
+                                    key = "type-${type.name}",
+                                    span = { GridItemSpan(maxLineSpan) },
+                                ) {
+                                    Column {
+                                        if (groupIndex > 0) {
+                                            HorizontalDivider(
+                                                modifier = Modifier.padding(top = 8.dp, bottom = 14.dp),
+                                                color = MaterialTheme.colorScheme.outlineVariant,
+                                            )
+                                        }
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            verticalAlignment = Alignment.CenterVertically,
+                                        ) {
+                                            Text(
+                                                type.displayName,
+                                                modifier = Modifier.weight(1f),
+                                                style = MaterialTheme.typography.titleSmall,
+                                                color = MaterialTheme.colorScheme.primary,
+                                                fontWeight = FontWeight.SemiBold,
+                                            )
+                                            Surface(
+                                                shape = RoundedCornerShape(10.dp),
+                                                color = MaterialTheme.colorScheme.primaryContainer,
+                                                contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
+                                            ) {
+                                                Text(
+                                                    "${pages.size} 题",
+                                                    modifier = Modifier.padding(horizontal = 9.dp, vertical = 4.dp),
+                                                    style = MaterialTheme.typography.labelMedium,
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                                items(pages, key = { it }) { page ->
+                                    val status = statusByPosition[page]
+                                    val container = when (status) {
+                                        QuestionAnswerStatus.CORRECT -> MaterialTheme.colorScheme.primary
+                                        QuestionAnswerStatus.INCORRECT -> MaterialTheme.colorScheme.error
+                                        null -> MaterialTheme.colorScheme.surfaceVariant
+                                    }
+                                    val content = when (status) {
+                                        QuestionAnswerStatus.CORRECT -> MaterialTheme.colorScheme.onPrimary
+                                        QuestionAnswerStatus.INCORRECT -> MaterialTheme.colorScheme.onError
+                                        null -> MaterialTheme.colorScheme.onSurfaceVariant
+                                    }
+                                    Surface(
+                                        onClick = { onQuestionClick(page) },
+                                        modifier = Modifier.aspectRatio(1f),
+                                        shape = RoundedCornerShape(14.dp),
+                                        color = container,
+                                        contentColor = content,
+                                        border = if (page == currentPage) {
+                                            BorderStroke(2.dp, MaterialTheme.colorScheme.onSurface)
+                                        } else {
+                                            null
+                                        },
+                                    ) {
+                                        Box(contentAlignment = Alignment.Center) {
+                                            Text(
+                                                "${page + 1}",
+                                                fontWeight = if (page == currentPage) FontWeight.Bold else FontWeight.Medium,
+                                            )
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -520,6 +716,16 @@ private fun QuestionNavigatorDialog(
         }
     }
 }
+
+private val QuestionType.navigatorOrder: Int
+    get() = when (this) {
+        QuestionType.SINGLE_CHOICE -> 0
+        QuestionType.MULTIPLE_CHOICE -> 1
+        QuestionType.TRUE_FALSE -> 2
+        QuestionType.CALCULATION -> 3
+        QuestionType.SHORT_ANSWER -> 4
+        QuestionType.UNKNOWN -> 5
+    }
 
 @Composable
 private fun NavigatorLegend(label: String, color: androidx.compose.ui.graphics.Color) {

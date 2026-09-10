@@ -40,7 +40,46 @@ data class AppSettings(
     val colorTheme: ColorTheme = ColorTheme.LAVENDER,
     val textScale: Float = 1f,
     val singleChoiceAutoNext: Boolean = false,
+    val llmConfig: LlmConfig = LlmConfig(),
 )
+
+enum class LlmProvider(
+    val displayName: String,
+    val defaultEndpointUrl: String,
+    val defaultModel: String,
+) {
+    DEEPSEEK(
+        displayName = "DeepSeek",
+        defaultEndpointUrl = "",
+        defaultModel = "deepseek-v4-flash",
+    ),
+    OPENAI_COMPATIBLE(
+        displayName = "OpenAI compatible",
+        defaultEndpointUrl = "",
+        defaultModel = "",
+    ),
+    CLAUDE(
+        displayName = "Claude",
+        defaultEndpointUrl = "",
+        defaultModel = "claude-sonnet-5",
+    ),
+    KIMI(
+        displayName = "Kimi",
+        defaultEndpointUrl = "",
+        defaultModel = "kimi-k3",
+    ),
+}
+
+data class LlmConfig(
+    val provider: LlmProvider = LlmProvider.OPENAI_COMPATIBLE,
+    val endpointUrl: String = LlmProvider.OPENAI_COMPATIBLE.defaultEndpointUrl,
+    val model: String = "",
+    val apiKey: String = "",
+    val anthropicVersion: String = "2023-06-01",
+) {
+    val isConfigured: Boolean
+        get() = endpointUrl.isNotBlank() && model.isNotBlank() && apiKey.isNotBlank()
+}
 
 enum class QuestionType(val displayName: String) {
     SINGLE_CHOICE("单选题"),
@@ -148,10 +187,25 @@ data class SheetMapping(
     val headerRowIndex: Int,
     val fixedType: QuestionType,
     val columns: List<ColumnField>,
+    val optionsSplit: OptionsSplitMapping? = null,
+)
+
+data class OptionsSplitMapping(
+    val columnIndex: Int,
+    val delimiter: String,
 )
 
 data class ImportAnalysis(
     val workbook: WorkbookData,
     val mappings: List<SheetMapping>,
     val requiresManualMapping: Boolean,
+)
+
+/**
+ * A deliberately small, declarative conversion script. The model may select input
+ * rows and columns, but cannot execute code, access files, or call Android APIs.
+ */
+data class ImportMappingScript(
+    val version: Int,
+    val sheets: List<SheetMapping>,
 )

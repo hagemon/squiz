@@ -12,6 +12,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowForwardIos
 import androidx.compose.material.icons.rounded.Palette
 import androidx.compose.material.icons.rounded.SystemUpdate
+import androidx.compose.material.icons.rounded.SmartToy
 import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
@@ -38,6 +39,7 @@ fun SettingsScreen(
     isDownloadingUpdate: Boolean,
     onThemeClick: () -> Unit,
     onQuizSettingsClick: () -> Unit,
+    onLlmSettingsClick: () -> Unit,
     onCheckForUpdate: () -> Unit,
 ) {
     Scaffold(
@@ -79,6 +81,12 @@ fun SettingsScreen(
                 title = "刷题设置",
                 subtitle = "答题与自动翻页",
                 onClick = onQuizSettingsClick,
+            )
+            SettingsEntry(
+                icon = Icons.Rounded.SmartToy,
+                title = "大模型接口",
+                subtitle = "供应商、模型与智能解析",
+                onClick = onLlmSettingsClick,
             )
             Text(
                 text = "关于",

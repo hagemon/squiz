@@ -51,6 +51,9 @@ import androidx.core.content.ContextCompat
 import com.hagemon.squiz.data.SquizRepository
 import com.hagemon.squiz.data.excel.ExcelAnalyzer
 import com.hagemon.squiz.data.excel.ExcelWorkbookReader
+import com.hagemon.squiz.data.llm.ImportDslV2Executor
+import com.hagemon.squiz.data.llm.ImportDiagnostic
+import com.hagemon.squiz.data.llm.LlmService
 import com.hagemon.squiz.data.update.AppUpdateInfo
 import com.hagemon.squiz.data.update.AppUpdateManager
 import com.hagemon.squiz.data.update.DownloadedUpdate
@@ -70,6 +73,7 @@ import com.hagemon.squiz.ui.screens.ImportConfigScreen
 import com.hagemon.squiz.ui.screens.ImportMappingScreen
 import com.hagemon.squiz.ui.screens.ImportPreviewScreen
 import com.hagemon.squiz.ui.screens.LibraryScreen
+import com.hagemon.squiz.ui.screens.LlmSettingsScreen
 import com.hagemon.squiz.ui.screens.MoveItemScreen
 import com.hagemon.squiz.ui.screens.PracticeHistoryScreen
 import com.hagemon.squiz.ui.screens.QuestionBankScreen
@@ -86,6 +90,7 @@ private enum class Destination {
     SETTINGS,
     THEME,
     QUIZ_SETTINGS,
+    LLM_SETTINGS,
     IMPORT_CONFIG,
     IMPORT_MAPPING,
     IMPORT_PREVIEW,
@@ -110,6 +115,12 @@ private data class PendingImport(
     val mappings: List<SheetMapping>,
 )
 
+private sealed interface SmartParseState {
+    data object Idle : SmartParseState
+    data class Generating(val completedSheets: Int, val totalSheets: Int) : SmartParseState
+    data class Converting(val processedRows: Int, val totalRows: Int) : SmartParseState
+}
+
 @Composable
 fun SquizApp(
     repository: SquizRepository,
@@ -121,6 +132,8 @@ fun SquizApp(
     var pendingFile by remember { mutableStateOf<PendingFile?>(null) }
     var pendingImport by remember { mutableStateOf<PendingImport?>(null) }
     var parsedQuestions by remember { mutableStateOf<List<ParsedQuestion>>(emptyList()) }
+    var importDiagnostics by remember { mutableStateOf<List<ImportDiagnostic>>(emptyList()) }
+    var importSkippedCount by remember { mutableIntStateOf(0) }
     var quizQuestions by remember { mutableStateOf<List<QuizQuestion>>(emptyList()) }
     var quizBankId by remember { mutableStateOf("") }
     var quizBankName by remember { mutableStateOf("") }
@@ -136,7 +149,10 @@ fun SquizApp(
     var quizReturnDestination by remember { mutableStateOf(Destination.QUESTION_BANK) }
     var speedDialScrim by remember { mutableStateOf(false) }
     var busy by remember { mutableStateOf(false) }
+    var smartParseState by remember { mutableStateOf<SmartParseState>(SmartParseState.Idle) }
+    var smartParseToken by remember { mutableIntStateOf(0) }
     val updateManager = remember(context.applicationContext) { AppUpdateManager(context) }
+    val llmService = remember { LlmService() }
     val snackbarHostState = remember { SnackbarHostState() }
     var availableUpdate by remember { mutableStateOf<AppUpdateInfo?>(null) }
     var downloadedUpdate by remember { mutableStateOf<DownloadedUpdate?>(null) }
@@ -258,9 +274,13 @@ fun SquizApp(
     }
 
     fun leaveImport() {
+        smartParseToken++
         pendingFile = null
         pendingImport = null
         parsedQuestions = emptyList()
+        importDiagnostics = emptyList()
+        importSkippedCount = 0
+        smartParseState = SmartParseState.Idle
         destination = Destination.LIBRARY
     }
 
@@ -370,7 +390,7 @@ fun SquizApp(
 
     BackHandler(enabled = !showNavigationBar) {
         when (destination) {
-            Destination.THEME, Destination.QUIZ_SETTINGS -> destination = Destination.SETTINGS
+            Destination.THEME, Destination.QUIZ_SETTINGS, Destination.LLM_SETTINGS -> destination = Destination.SETTINGS
             Destination.IMPORT_PREVIEW -> destination = Destination.IMPORT_MAPPING
             Destination.IMPORT_CONFIG, Destination.IMPORT_MAPPING -> leaveImport()
             Destination.MOVE_ITEM -> {
@@ -463,6 +483,7 @@ fun SquizApp(
                         isDownloadingUpdate = isDownloadingUpdate,
                         onThemeClick = { destination = Destination.THEME },
                         onQuizSettingsClick = { destination = Destination.QUIZ_SETTINGS },
+                        onLlmSettingsClick = { destination = Destination.LLM_SETTINGS },
                         onCheckForUpdate = { checkForUpdates(manual = true) },
                     )
                     Destination.THEME -> ThemeSettingsScreen(
@@ -474,6 +495,12 @@ fun SquizApp(
                         settings = settings,
                         repository = repository,
                         onBack = { destination = Destination.SETTINGS },
+                    )
+                    Destination.LLM_SETTINGS -> LlmSettingsScreen(
+                        config = settings.llmConfig,
+                        onBack = { destination = Destination.SETTINGS },
+                        onTest = { config -> runCatching { llmService.testConnection(config) } },
+                        onSave = { config -> runCatching { repository.setLlmConfig(config) } },
                     )
                     Destination.IMPORT_CONFIG -> pendingFile?.let { file ->
                         ImportConfigScreen(
@@ -497,7 +524,92 @@ fun SquizApp(
                                     message("没有解析到题目，请检查字段对应关系")
                                 } else {
                                     parsedQuestions = questions
+                                    importDiagnostics = emptyList()
+                                    importSkippedCount = 0
                                     destination = Destination.IMPORT_PREVIEW
+                                }
+                            },
+                            llmConfigured = settings.llmConfig.isConfigured,
+                            smartParseStatus = when (val state = smartParseState) {
+                                SmartParseState.Idle -> null
+                                is SmartParseState.Generating ->
+                                    "正在生成方案 · ${state.completedSheets}/${state.totalSheets}"
+                                is SmartParseState.Converting -> {
+                                    val percent = if (state.totalRows == 0) 0 else {
+                                        state.processedRows * 100 / state.totalRows
+                                    }
+                                    "正在转换 · $percent%"
+                                }
+                            },
+                            smartParseProgress = (smartParseState as? SmartParseState.Converting)?.let { state ->
+                                if (state.totalRows == 0) 0f else state.processedRows.toFloat() / state.totalRows
+                            },
+                            onSmartParse = {
+                                if (smartParseState == SmartParseState.Idle) {
+                                    scope.launch {
+                                        val requestToken = ++smartParseToken
+                                        val totalSheets = pending.analysis.workbook.sheets.count { sheet ->
+                                            sheet.rows.any { row -> row.any(String::isNotBlank) }
+                                        }
+                                        smartParseState = SmartParseState.Generating(0, totalSheets)
+                                        runCatching {
+                                            val script = llmService.createImportScriptV2(
+                                                settings.llmConfig,
+                                                pending.analysis.workbook,
+                                            ) { completed, total ->
+                                                scope.launch {
+                                                    if (
+                                                        requestToken == smartParseToken &&
+                                                        smartParseState is SmartParseState.Generating
+                                                    ) {
+                                                        smartParseState = SmartParseState.Generating(completed, total)
+                                                    }
+                                                }
+                                            }
+                                            require(
+                                                requestToken == smartParseToken &&
+                                                    destination == Destination.IMPORT_MAPPING,
+                                            ) { "智能解析已取消" }
+                                            smartParseState = SmartParseState.Converting(0, 0)
+                                            val result = ImportDslV2Executor.executeWithProgress(
+                                                pending.analysis.workbook,
+                                                script,
+                                            ) { processed, total ->
+                                                scope.launch {
+                                                    if (
+                                                        requestToken == smartParseToken &&
+                                                        smartParseState is SmartParseState.Converting
+                                                    ) {
+                                                        smartParseState = SmartParseState.Converting(processed, total)
+                                                    }
+                                                }
+                                            }
+                                            require(result.questions.isNotEmpty()) {
+                                                result.diagnostics.firstOrNull()?.message ?: "智能转换后没有可导入的题目"
+                                            }
+                                            result
+                                        }.onSuccess { result ->
+                                            if (requestToken == smartParseToken && destination == Destination.IMPORT_MAPPING) {
+                                                parsedQuestions = result.questions
+                                                importDiagnostics = result.diagnostics
+                                                importSkippedCount = result.unmatchedRows + result.invalidRows
+                                                destination = Destination.IMPORT_PREVIEW
+                                                val failed = result.unmatchedRows + result.invalidRows
+                                                snackbarHostState.showSnackbar(
+                                                    if (failed == 0) {
+                                                        "智能解析完成，共识别 ${result.convertedRows} 题"
+                                                    } else {
+                                                        "识别 ${result.convertedRows} 题，另有 $failed 行未转换"
+                                                    },
+                                                )
+                                            }
+                                        }.onFailure {
+                                            if (requestToken == smartParseToken && destination == Destination.IMPORT_MAPPING) {
+                                                snackbarHostState.showSnackbar(it.message ?: "智能解析失败")
+                                            }
+                                        }
+                                        if (requestToken == smartParseToken) smartParseState = SmartParseState.Idle
+                                    }
                                 }
                             },
                         )
@@ -505,6 +617,8 @@ fun SquizApp(
                     Destination.IMPORT_PREVIEW -> pendingImport?.let { pending ->
                         ImportPreviewScreen(
                             questions = parsedQuestions,
+                            diagnostics = importDiagnostics,
+                            skippedRowCount = importSkippedCount,
                             onBack = { destination = Destination.IMPORT_MAPPING },
                             onConfirm = {
                                 scope.launch {

@@ -59,18 +59,22 @@ object ExcelAnalyzer {
             }
             if (type == QuestionType.UNKNOWN) return@mapIndexedNotNull null
             val answer = row.getOrNull(answerColumn).orEmpty().trim()
-            val correctLabels = answer.uppercase().let { value ->
-                Regex("[A-G]").findAll(value).map { it.value }.toSet()
-            }
-            var options = mapping.columns.mapIndexedNotNull { column, field ->
+            val mappedOptions = mapping.columns.mapIndexedNotNull { column, field ->
                 val label = field.optionLabel ?: return@mapIndexedNotNull null
                 val text = row.getOrNull(column).orEmpty().trim()
                 if (text.isBlank()) return@mapIndexedNotNull null
-                QuestionOption(
-                    label = label,
-                    text = text,
-                    isCorrect = label in correctLabels || text.equals(answer, ignoreCase = true),
-                )
+                label to text
+            }
+            val optionValues = mapping.optionsSplit?.let { split ->
+                OptionTextParser.split(row.getOrNull(split.columnIndex).orEmpty(), split.delimiter)
+            }.orEmpty().ifEmpty { mappedOptions }
+            val compactAnswer = answer.uppercase().replace(Regex("[\\s,，;；、/|]+"), "")
+            val correctLabels = compactAnswer.takeIf { it.matches(Regex("[A-Z]+")) }
+                ?.map(Char::toString)
+                ?.toSet()
+                .orEmpty()
+            var options = optionValues.map { (label, text) ->
+                QuestionOption(label, text, label in correctLabels || text.equals(answer, ignoreCase = true))
             }
             if (type == QuestionType.TRUE_FALSE && options.isEmpty()) {
                 val normalized = answer.replace("正确", "对").replace("错误", "错").trim()
@@ -108,7 +112,7 @@ object ExcelAnalyzer {
         if (ColumnField.CONTENT !in columns || ColumnField.ANSWER !in columns) return false
         return when (fixedType) {
             QuestionType.SINGLE_CHOICE, QuestionType.MULTIPLE_CHOICE ->
-                columns.count { it.optionLabel != null } >= 2
+                optionsSplit != null || columns.count { it.optionLabel != null } >= 2
             else -> true
         }
     }

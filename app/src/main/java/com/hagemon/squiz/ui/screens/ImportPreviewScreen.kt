@@ -16,6 +16,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.rounded.Check
+import androidx.compose.material.icons.rounded.WarningAmber
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -32,11 +33,14 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.hagemon.squiz.model.ParsedQuestion
+import com.hagemon.squiz.data.llm.ImportDiagnostic
 
 @OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
 @Composable
 fun ImportPreviewScreen(
     questions: List<ParsedQuestion>,
+    diagnostics: List<ImportDiagnostic> = emptyList(),
+    skippedRowCount: Int = 0,
     onBack: () -> Unit,
     onConfirm: () -> Unit,
 ) {
@@ -78,6 +82,39 @@ fun ImportPreviewScreen(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     style = MaterialTheme.typography.bodyMedium,
                 )
+            }
+            if (skippedRowCount > 0) {
+                item {
+                    Card(
+                        shape = RoundedCornerShape(20.dp),
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
+                    ) {
+                        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Icon(Icons.Rounded.WarningAmber, contentDescription = null)
+                                Text(
+                                    "$skippedRowCount 行未能自动转换",
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = MaterialTheme.colorScheme.onErrorContainer,
+                                )
+                            }
+                            diagnostics.take(5).forEach { diagnostic ->
+                                Text(
+                                    "${diagnostic.sheetName} · 第 ${diagnostic.sourceRow} 行：${diagnostic.message}",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onErrorContainer,
+                                )
+                            }
+                            if (diagnostics.size > 5) {
+                                Text(
+                                    "另有 ${diagnostics.size - 5} 条诊断未显示",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onErrorContainer,
+                                )
+                            }
+                        }
+                    }
+                }
             }
             items(questions.take(3)) { question ->
                 Card(

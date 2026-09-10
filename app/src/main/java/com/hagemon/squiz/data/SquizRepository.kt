@@ -20,10 +20,13 @@ import com.hagemon.squiz.data.local.QuestionWithOptions
 import com.hagemon.squiz.data.local.SessionQuestionEntity
 import com.hagemon.squiz.data.local.SessionQuestionWithOptions
 import com.hagemon.squiz.data.local.SquizDatabase
+import com.hagemon.squiz.data.security.ApiKeyStore
 import com.hagemon.squiz.model.AppSettings
 import com.hagemon.squiz.model.ColorTheme
 import com.hagemon.squiz.model.LibraryItem
 import com.hagemon.squiz.model.LibraryItemType
+import com.hagemon.squiz.model.LlmConfig
+import com.hagemon.squiz.model.LlmProvider
 import com.hagemon.squiz.model.ParsedQuestion
 import com.hagemon.squiz.model.PracticeAnswerSnapshot
 import com.hagemon.squiz.model.PracticeMode
@@ -45,6 +48,7 @@ private val Context.squizDataStore by preferencesDataStore(name = "squiz_prefere
 
 class SquizRepository(context: Context) {
     private val dataStore = context.applicationContext.squizDataStore
+    private val apiKeyStore = ApiKeyStore(context)
     private val database = SquizDatabase.get(context)
     private val dao = database.dao()
 
@@ -54,6 +58,14 @@ class SquizRepository(context: Context) {
             colorTheme = preferences[Keys.colorTheme].toEnumOrDefault(ColorTheme.LAVENDER),
             textScale = (preferences[Keys.textScale] ?: 1f).coerceIn(0.8f, 1.3f),
             singleChoiceAutoNext = preferences[Keys.singleChoiceAutoNext] ?: false,
+            llmConfig = LlmConfig(
+                provider = preferences[Keys.llmProvider].toEnumOrDefault(LlmProvider.OPENAI_COMPATIBLE),
+                endpointUrl = preferences[Keys.llmEndpointUrl]
+                    ?: LlmProvider.OPENAI_COMPATIBLE.defaultEndpointUrl,
+                model = preferences[Keys.llmModel].orEmpty(),
+                apiKey = apiKeyStore.read(),
+                anthropicVersion = preferences[Keys.llmAnthropicVersion] ?: "2023-06-01",
+            ),
         )
     }
 
@@ -103,6 +115,21 @@ class SquizRepository(context: Context) {
 
     suspend fun setSingleChoiceAutoNext(enabled: Boolean) {
         dataStore.edit { it[Keys.singleChoiceAutoNext] = enabled }
+    }
+
+    suspend fun setLlmConfig(config: LlmConfig) {
+        require(config.endpointUrl.startsWith("https://") || config.endpointUrl.startsWith("http://")) {
+            "API URL 必须以 http:// 或 https:// 开头"
+        }
+        require(config.model.isNotBlank()) { "请填写模型名称" }
+        require(config.apiKey.isNotBlank()) { "请填写 API Key" }
+        apiKeyStore.write(config.apiKey.trim())
+        dataStore.edit { preferences ->
+            preferences[Keys.llmProvider] = config.provider.name
+            preferences[Keys.llmEndpointUrl] = config.endpointUrl.trim()
+            preferences[Keys.llmModel] = config.model.trim()
+            preferences[Keys.llmAnthropicVersion] = config.anthropicVersion.trim().ifBlank { "2023-06-01" }
+        }
     }
 
     suspend fun addFolder(name: String, parentId: String?) {
@@ -362,6 +389,10 @@ class SquizRepository(context: Context) {
         val colorTheme = stringPreferencesKey("color_theme")
         val textScale = floatPreferencesKey("text_scale")
         val singleChoiceAutoNext = booleanPreferencesKey("single_choice_auto_next")
+        val llmProvider = stringPreferencesKey("llm_provider")
+        val llmEndpointUrl = stringPreferencesKey("llm_endpoint_url")
+        val llmModel = stringPreferencesKey("llm_model")
+        val llmAnthropicVersion = stringPreferencesKey("llm_anthropic_version")
     }
 }
 
