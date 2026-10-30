@@ -115,6 +115,7 @@ data class QuizQuestion(
     val answer: String,
     val explanation: String? = null,
     val sheetName: String,
+    val hidden: Boolean = false,
 )
 
 enum class PracticeMode {
@@ -143,6 +144,11 @@ data class PracticeAnswerSnapshot(
     val selectedLabels: Set<String>,
     val isCorrect: Boolean,
     val answeredAt: Long,
+)
+
+data class BankPracticeSettings(
+    val shuffleReviewQuestions: Boolean = false,
+    val typeFirstOrdering: Boolean = true,
 )
 
 data class WorkbookData(
@@ -188,6 +194,7 @@ data class SheetMapping(
     val fixedType: QuestionType,
     val columns: List<ColumnField>,
     val optionsSplit: OptionsSplitMapping? = null,
+    val skipImport: Boolean = false,
 )
 
 data class OptionsSplitMapping(

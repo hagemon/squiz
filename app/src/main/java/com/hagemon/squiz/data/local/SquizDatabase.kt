@@ -59,6 +59,8 @@ data class QuestionBankEntity(
     val importedAt: Long,
     val lastOpenedAt: Long?,
     val questionCount: Int,
+    val shuffleReviewQuestions: Boolean = false,
+    val typeFirstOrdering: Boolean = true,
 )
 
 @Entity(
@@ -83,6 +85,7 @@ data class QuestionEntity(
     val explanation: String?,
     val sheetName: String,
     val sourceRow: Int,
+    val hidden: Boolean = false,
 )
 
 @Entity(
@@ -126,6 +129,8 @@ data class PracticeSessionEntity(
     val completedAt: Long?,
     val currentPosition: Int,
     val totalQuestions: Int,
+    val orderMode: String = "LEGACY",
+    val originSessionId: String? = null,
 )
 
 @Entity(
@@ -266,6 +271,15 @@ interface SquizDao {
     @Query("SELECT * FROM folders WHERE id = :id")
     suspend fun getFolder(id: String): FolderEntity?
 
+    @Query("SELECT * FROM question_banks WHERE id = :id")
+    suspend fun getBank(id: String): QuestionBankEntity?
+
+    @Query("UPDATE question_banks SET shuffleReviewQuestions = :enabled WHERE id = :bankId")
+    suspend fun setShuffleReviewQuestions(bankId: String, enabled: Boolean)
+
+    @Query("UPDATE question_banks SET typeFirstOrdering = :enabled WHERE id = :bankId")
+    suspend fun setTypeFirstOrdering(bankId: String, enabled: Boolean)
+
     @Query("DELETE FROM folders WHERE id = :id")
     suspend fun deleteFolder(id: String)
 
@@ -275,37 +289,90 @@ interface SquizDao {
     @Query("UPDATE question_banks SET lastOpenedAt = :openedAt WHERE id = :id")
     suspend fun touchBank(id: String, openedAt: Long)
 
+    @Query(
+        """
+        UPDATE question_banks
+        SET questionCount = (SELECT COUNT(*) FROM questions WHERE bankId = :bankId),
+            lastOpenedAt = :updatedAt
+        WHERE id = :bankId
+        """,
+    )
+    suspend fun refreshBankQuestionCount(bankId: String, updatedAt: Long)
+
     @Transaction
-    @Query("SELECT * FROM questions WHERE bankId = :bankId ORDER BY position ASC LIMIT :limit OFFSET :offset")
+    @Query("SELECT * FROM questions WHERE bankId = :bankId AND hidden = 0 ORDER BY position ASC LIMIT :limit OFFSET :offset")
     suspend fun getQuestionsPage(bankId: String, offset: Int, limit: Int): List<QuestionWithOptions>
 
     @Transaction
     @Query("SELECT * FROM questions WHERE bankId = :bankId ORDER BY position ASC")
     suspend fun getAllQuestions(bankId: String): List<QuestionWithOptions>
 
-    @Query("SELECT id FROM questions WHERE bankId = :bankId ORDER BY position ASC")
-    suspend fun getQuestionIds(bankId: String): List<Long>
+    @Query(
+        """
+        SELECT id FROM questions
+        WHERE bankId = :bankId AND hidden = 0
+        ORDER BY CASE WHEN :typeFirstOrdering = 1 THEN CASE type
+            WHEN 'SINGLE_CHOICE' THEN 0
+            WHEN 'MULTIPLE_CHOICE' THEN 1
+            WHEN 'TRUE_FALSE' THEN 2
+            WHEN 'CALCULATION' THEN 3
+            WHEN 'SHORT_ANSWER' THEN 4
+            ELSE 5 END ELSE 0 END,
+            position ASC
+        """,
+    )
+    suspend fun getQuestionIds(bankId: String, typeFirstOrdering: Boolean): List<Long>
 
-    @Query("SELECT id FROM questions WHERE bankId = :bankId AND type IN (:types) ORDER BY RANDOM() LIMIT :limit")
+    @Query("SELECT id FROM questions WHERE bankId = :bankId AND hidden = 0 AND type IN (:types) ORDER BY RANDOM() LIMIT :limit")
     suspend fun getRandomQuestionIds(bankId: String, types: List<String>, limit: Int): List<Long>
+
+    @Transaction
+    @Query("SELECT * FROM questions WHERE bankId IN (:bankIds) ORDER BY bankId, position ASC")
+    suspend fun getQuestionsInBanks(bankIds: List<String>): List<QuestionWithOptions>
+
+    @Query("SELECT COUNT(*) FROM questions WHERE bankId = :bankId AND hidden = 0")
+    suspend fun getVisibleQuestionCount(bankId: String): Int
+
+    @Query("SELECT COUNT(*) FROM questions WHERE bankId = :bankId AND hidden = 1")
+    suspend fun getHiddenQuestionCount(bankId: String): Int
+
+    @Query("UPDATE questions SET hidden = :hidden WHERE id = :questionId")
+    suspend fun setQuestionHidden(questionId: Long, hidden: Boolean)
+
+    @Query("UPDATE questions SET hidden = 1 WHERE id IN (:questionIds)")
+    suspend fun hideQuestions(questionIds: List<Long>)
 
     @Query(
         """
         SELECT a.questionId FROM practice_answers a
         INNER JOIN questions q ON q.id = a.questionId
-        WHERE q.bankId = :bankId AND a.isCorrect = 0
+        WHERE q.bankId = :bankId AND q.hidden = 0 AND a.isCorrect = 0
         GROUP BY a.questionId
         HAVING COUNT(*) >= :minimumWrongCount
-        ORDER BY COUNT(*) DESC, MIN(q.position) ASC
+        ORDER BY CASE WHEN :typeFirstOrdering = 1 THEN CASE q.type
+            WHEN 'SINGLE_CHOICE' THEN 0
+            WHEN 'MULTIPLE_CHOICE' THEN 1
+            WHEN 'TRUE_FALSE' THEN 2
+            WHEN 'CALCULATION' THEN 3
+            WHEN 'SHORT_ANSWER' THEN 4
+            ELSE 5 END ELSE 0 END,
+            MIN(q.position) ASC
         """,
     )
-    suspend fun getWrongQuestionIds(bankId: String, minimumWrongCount: Int): List<Long>
+    suspend fun getWrongQuestionIds(
+        bankId: String,
+        minimumWrongCount: Int,
+        typeFirstOrdering: Boolean,
+    ): List<Long>
 
     @Insert
     suspend fun insertPracticeSession(session: PracticeSessionEntity)
 
     @Insert
     suspend fun insertSessionQuestions(questions: List<SessionQuestionEntity>)
+
+    @Insert
+    suspend fun insertPracticeAnswers(answers: List<PracticeAnswerEntity>)
 
     @Insert(onConflict = androidx.room.OnConflictStrategy.REPLACE)
     suspend fun upsertPracticeAnswer(answer: PracticeAnswerEntity)
@@ -315,6 +382,22 @@ interface SquizDao {
 
     @Query("UPDATE practice_sessions SET completedAt = :completedAt, currentPosition = totalQuestions - 1 WHERE id = :sessionId")
     suspend fun completePracticeSession(sessionId: String, completedAt: Long)
+
+    @Query(
+        """
+        UPDATE practice_sessions
+        SET currentPosition = :currentPosition,
+            totalQuestions = :totalQuestions,
+            completedAt = :completedAt
+        WHERE id = :sessionId
+        """,
+    )
+    suspend fun updateMergedPracticeSession(
+        sessionId: String,
+        currentPosition: Int,
+        totalQuestions: Int,
+        completedAt: Long?,
+    )
 
     @Query(
         """
@@ -344,6 +427,29 @@ interface SquizDao {
 
     @Query("DELETE FROM practice_sessions WHERE id IN (:sessionIds)")
     suspend fun deletePracticeSessions(sessionIds: List<String>)
+
+    @Query("SELECT * FROM practice_sessions WHERE bankId = :bankId ORDER BY startedAt ASC")
+    suspend fun getPracticeSessionEntities(bankId: String): List<PracticeSessionEntity>
+
+    @Query(
+        """
+        SELECT sq.* FROM session_questions sq
+        INNER JOIN practice_sessions s ON s.id = sq.sessionId
+        WHERE s.bankId = :bankId
+        ORDER BY sq.sessionId ASC, sq.orderIndex ASC
+        """,
+    )
+    suspend fun getSessionQuestionEntities(bankId: String): List<SessionQuestionEntity>
+
+    @Query(
+        """
+        SELECT a.* FROM practice_answers a
+        INNER JOIN practice_sessions s ON s.id = a.sessionId
+        WHERE s.bankId = :bankId
+        ORDER BY a.sessionId ASC, a.answeredAt ASC
+        """,
+    )
+    suspend fun getPracticeAnswerEntities(bankId: String): List<PracticeAnswerEntity>
 
     @Query(
         """
@@ -387,6 +493,31 @@ interface SquizDao {
     )
     suspend fun getPracticeSession(sessionId: String): PracticeSessionSummaryRow?
 
+    @Query("SELECT questionId FROM session_questions WHERE sessionId = :sessionId ORDER BY orderIndex ASC")
+    suspend fun getSessionQuestionIds(sessionId: String): List<Long>
+
+    @Query("SELECT questionId FROM practice_answers WHERE sessionId = :sessionId")
+    suspend fun getAnsweredQuestionIds(sessionId: String): List<Long>
+
+    @Query("DELETE FROM session_questions WHERE sessionId = :sessionId")
+    suspend fun deleteSessionQuestions(sessionId: String)
+
+    @Query(
+        """
+        UPDATE practice_sessions
+        SET currentPosition = :currentPosition,
+            totalQuestions = :totalQuestions,
+            orderMode = :orderMode
+        WHERE id = :sessionId
+        """,
+    )
+    suspend fun updateSessionOrdering(
+        sessionId: String,
+        currentPosition: Int,
+        totalQuestions: Int,
+        orderMode: String,
+    )
+
     @Transaction
     @Query(
         """
@@ -421,7 +552,7 @@ interface SquizDao {
         SELECT COUNT(*) FROM (
             SELECT a.questionId FROM practice_answers a
             INNER JOIN questions q ON q.id = a.questionId
-            WHERE q.bankId = :bankId AND a.isCorrect = 0
+            WHERE q.bankId = :bankId AND q.hidden = 0 AND a.isCorrect = 0
             GROUP BY a.questionId
             HAVING COUNT(*) >= :minimumWrongCount
         )
@@ -434,7 +565,7 @@ interface SquizDao {
         SELECT COALESCE(MAX(wrongCount), 0) FROM (
             SELECT COUNT(*) AS wrongCount FROM practice_answers a
             INNER JOIN questions q ON q.id = a.questionId
-            WHERE q.bankId = :bankId AND a.isCorrect = 0
+            WHERE q.bankId = :bankId AND q.hidden = 0 AND a.isCorrect = 0
             GROUP BY a.questionId
         )
         """,
@@ -449,10 +580,19 @@ interface SquizDao {
 
     @Query(
         """
-        SELECT g.questionId FROM guessed_questions g
+        SELECT g.* FROM guessed_questions g
         INNER JOIN questions q ON q.id = g.questionId
         WHERE q.bankId = :bankId
-        ORDER BY g.markedAt DESC
+        """,
+    )
+    suspend fun getGuessedQuestionEntities(bankId: String): List<GuessedQuestionEntity>
+
+    @Query(
+        """
+        SELECT g.questionId FROM guessed_questions g
+        INNER JOIN questions q ON q.id = g.questionId
+        WHERE q.bankId = :bankId AND q.hidden = 0
+        ORDER BY q.position ASC
         """,
     )
     suspend fun getGuessedQuestionIds(bankId: String): List<Long>
@@ -461,7 +601,7 @@ interface SquizDao {
         """
         SELECT COUNT(*) FROM guessed_questions g
         INNER JOIN questions q ON q.id = g.questionId
-        WHERE q.bankId = :bankId
+        WHERE q.bankId = :bankId AND q.hidden = 0
         """,
     )
     suspend fun getGuessedQuestionCount(bankId: String): Int
@@ -478,7 +618,7 @@ interface SquizDao {
         PracticeAnswerEntity::class,
         GuessedQuestionEntity::class,
     ],
-    version = 4,
+    version = 7,
     exportSchema = false,
 )
 abstract class SquizDatabase : RoomDatabase() {
@@ -492,7 +632,14 @@ abstract class SquizDatabase : RoomDatabase() {
                 context.applicationContext,
                 SquizDatabase::class.java,
                 "squiz.db",
-            ).addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4).build().also { instance = it }
+            ).addMigrations(
+                MIGRATION_1_2,
+                MIGRATION_2_3,
+                MIGRATION_3_4,
+                MIGRATION_4_5,
+                MIGRATION_5_6,
+                MIGRATION_6_7,
+            ).build().also { instance = it }
         }
 
         private val MIGRATION_1_2 = object : Migration(1, 2) {
@@ -550,6 +697,32 @@ abstract class SquizDatabase : RoomDatabase() {
                 db.execSQL("DROP TABLE `guessed_questions`")
                 db.execSQL("ALTER TABLE `guessed_questions_new` RENAME TO `guessed_questions`")
                 db.execSQL("CREATE INDEX IF NOT EXISTS `index_guessed_questions_sessionId` ON `guessed_questions` (`sessionId`)")
+            }
+        }
+
+        private val MIGRATION_4_5 = object : Migration(4, 5) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE `questions` ADD COLUMN `hidden` INTEGER NOT NULL DEFAULT 0")
+            }
+        }
+
+        private val MIGRATION_5_6 = object : Migration(5, 6) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "ALTER TABLE `question_banks` ADD COLUMN `shuffleReviewQuestions` INTEGER NOT NULL DEFAULT 0",
+                )
+                db.execSQL(
+                    "ALTER TABLE `question_banks` ADD COLUMN `typeFirstOrdering` INTEGER NOT NULL DEFAULT 1",
+                )
+                db.execSQL(
+                    "ALTER TABLE `practice_sessions` ADD COLUMN `orderMode` TEXT NOT NULL DEFAULT 'LEGACY'",
+                )
+            }
+        }
+
+        private val MIGRATION_6_7 = object : Migration(6, 7) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE `practice_sessions` ADD COLUMN `originSessionId` TEXT")
             }
         }
     }

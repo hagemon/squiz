@@ -302,7 +302,7 @@ fun SquizApp(
         scope.launch {
             busy = true
             runCatching {
-                val currentSession = repository.getPracticeSession(session.id) ?: session
+                val currentSession = repository.preparePracticeSession(session.id) ?: session
                 val effectiveReviewMode = reviewMode || currentSession.isCompleted
                 val initialPage = if (effectiveReviewMode) 0 else currentSession.currentPosition
                 val chunkStart = initialPage / 40 * 40
@@ -548,14 +548,20 @@ fun SquizApp(
                                 if (smartParseState == SmartParseState.Idle) {
                                     scope.launch {
                                         val requestToken = ++smartParseToken
-                                        val totalSheets = pending.analysis.workbook.sheets.count { sheet ->
+                                        val includedSheetNames = pending.mappings
+                                            .filterNot(SheetMapping::skipImport)
+                                            .mapTo(hashSetOf(), SheetMapping::sheetName)
+                                        val importWorkbook = pending.analysis.workbook.copy(
+                                            sheets = pending.analysis.workbook.sheets.filter { it.name in includedSheetNames },
+                                        )
+                                        val totalSheets = importWorkbook.sheets.count { sheet ->
                                             sheet.rows.any { row -> row.any(String::isNotBlank) }
                                         }
                                         smartParseState = SmartParseState.Generating(0, totalSheets)
                                         runCatching {
                                             val script = llmService.createImportScriptV2(
                                                 settings.llmConfig,
-                                                pending.analysis.workbook,
+                                                importWorkbook,
                                             ) { completed, total ->
                                                 scope.launch {
                                                     if (
@@ -572,7 +578,7 @@ fun SquizApp(
                                             ) { "智能解析已取消" }
                                             smartParseState = SmartParseState.Converting(0, 0)
                                             val result = ImportDslV2Executor.executeWithProgress(
-                                                pending.analysis.workbook,
+                                                importWorkbook,
                                                 script,
                                             ) { processed, total ->
                                                 scope.launch {
@@ -690,7 +696,6 @@ fun SquizApp(
                         initialPage = quizInitialPage,
                         initialAnswers = quizInitialAnswers,
                         initialGuessedQuestionIds = quizGuessedQuestionIds,
-                        guessedMarkEnabled = quizSessionId != null,
                         reviewMode = quizReviewMode,
                         onLoadPage = { offset, limit ->
                             val sessionId = quizSessionId
@@ -716,6 +721,10 @@ fun SquizApp(
                             if (sessionId != null) {
                                 scope.launch { repository.setQuestionGuessed(sessionId, questionId, guessed) }
                             }
+                        },
+                        llmConfigured = settings.llmConfig.isConfigured,
+                        onAskLlm = { question ->
+                            llmService.explainQuestion(settings.llmConfig, question)
                         },
                         onFinish = {
                             leaveQuiz()

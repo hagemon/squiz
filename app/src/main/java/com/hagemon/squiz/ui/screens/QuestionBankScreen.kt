@@ -20,6 +20,7 @@ import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.material.icons.rounded.History
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.Quiz
+import androidx.compose.material.icons.automirrored.rounded.Rule
 import androidx.compose.material.icons.rounded.Shuffle
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -83,6 +84,10 @@ fun QuestionBankScreen(
     var wrongCount by remember { mutableIntStateOf(0) }
     var maximumWrongCount by remember { mutableIntStateOf(0) }
     var guessedCount by remember { mutableIntStateOf(0) }
+    var visibleQuestionCount by remember(bank.id) { mutableIntStateOf(bank.questionCount) }
+    var hiddenQuestionCount by remember(bank.id) { mutableIntStateOf(0) }
+    var questionCountRefresh by remember { mutableIntStateOf(0) }
+    var showQuestionManager by remember { mutableStateOf(false) }
     var randomCountText by remember(bank.questionCount) {
         mutableStateOf(minOf(20, bank.questionCount.coerceAtLeast(1)).toString())
     }
@@ -90,12 +95,18 @@ fun QuestionBankScreen(
         mutableStateOf(setOf(QuestionType.SINGLE_CHOICE, QuestionType.MULTIPLE_CHOICE, QuestionType.TRUE_FALSE))
     }
 
-    LaunchedEffect(bank.id, sessions) {
+    LaunchedEffect(bank.id, sessions, questionCountRefresh) {
         maximumWrongCount = repository.getMaximumWrongCount(bank.id)
         guessedCount = repository.getGuessedQuestionCount(bank.id)
+        visibleQuestionCount = repository.getVisibleQuestionCount(bank.id)
+        hiddenQuestionCount = repository.getHiddenQuestionCount(bank.id)
+        val currentRandomCount = randomCountText.toIntOrNull()
+        if (visibleQuestionCount > 0 && (currentRandomCount == null || currentRandomCount > visibleQuestionCount)) {
+            randomCountText = minOf(20, visibleQuestionCount).toString()
+        }
         wrongLevel = if (maximumWrongCount == 0) 1 else wrongLevel.coerceIn(1, maximumWrongCount)
     }
-    LaunchedEffect(bank.id, wrongLevel, maximumWrongCount, sessions) {
+    LaunchedEffect(bank.id, wrongLevel, maximumWrongCount, sessions, questionCountRefresh) {
         wrongCount = if (maximumWrongCount == 0) 0 else repository.getWrongQuestionCount(bank.id, wrongLevel)
     }
 
@@ -108,7 +119,7 @@ fun QuestionBankScreen(
                     Column {
                         Text(bank.name, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         Text(
-                            "${bank.questionCount} 题",
+                            if (hiddenQuestionCount == 0) "$visibleQuestionCount 题" else "可练习 $visibleQuestionCount · 已隐藏 $hiddenQuestionCount",
                             style = MaterialTheme.typography.labelMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -133,7 +144,7 @@ fun QuestionBankScreen(
                     icon = { Icon(Icons.Rounded.PlayArrow, contentDescription = null) },
                     title = "练习",
                     supporting = if (unfinished == null) {
-                        "按题库顺序开始一轮新的练习"
+                        "先按单选、多选、判断排序，同题型内按原题号练习"
                     } else {
                         "有一轮练习尚未完成，可从第 ${unfinished.currentPosition + 1} 题继续"
                     },
@@ -142,13 +153,36 @@ fun QuestionBankScreen(
                         Button(onClick = { onContinue(unfinished) }, modifier = Modifier.fillMaxWidth()) {
                             Text("继续练习 · ${formatSessionTime(unfinished.startedAt)}")
                         }
-                        TextButton(onClick = onStartNew, modifier = Modifier.align(Alignment.End)) {
+                        TextButton(
+                            onClick = onStartNew,
+                            enabled = visibleQuestionCount > 0,
+                            modifier = Modifier.align(Alignment.End),
+                        ) {
                             Text("开始新的练习")
                         }
                     } else {
-                        Button(onClick = onStartNew, modifier = Modifier.fillMaxWidth()) {
+                        Button(onClick = onStartNew, enabled = visibleQuestionCount > 0, modifier = Modifier.fillMaxWidth()) {
                             Text("开始练习")
                         }
+                    }
+                }
+            }
+
+            item {
+                PracticeCard(
+                    icon = { Icon(Icons.AutoMirrored.Rounded.Rule, contentDescription = null) },
+                    title = "题目管理",
+                    supporting = "做题顺序、去重等设置",
+                ) {
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                        Text("可练习 $visibleQuestionCount 题", color = MaterialTheme.colorScheme.primary)
+                        Text("已隐藏 $hiddenQuestionCount 题", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    OutlinedButton(
+                        onClick = { showQuestionManager = true },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text("打开题目管理")
                     }
                 }
             }
@@ -222,7 +256,7 @@ fun QuestionBankScreen(
             }
 
             item {
-                val maximum = bank.questionCount.coerceAtLeast(1)
+                val maximum = visibleQuestionCount.coerceAtLeast(1)
                 val randomCount = randomCountText.toIntOrNull()
                 val validCount = randomCount != null && randomCount in 1..maximum
                 PracticeCard(
@@ -255,7 +289,7 @@ fun QuestionBankScreen(
                     )
                     Button(
                         onClick = { onStartRandom(selectedTypes, requireNotNull(randomCount)) },
-                        enabled = selectedTypes.isNotEmpty() && bank.questionCount > 0 && validCount,
+                        enabled = selectedTypes.isNotEmpty() && visibleQuestionCount > 0 && validCount,
                         modifier = Modifier.fillMaxWidth(),
                     ) {
                         Icon(Icons.Rounded.Quiz, contentDescription = null)
@@ -265,6 +299,17 @@ fun QuestionBankScreen(
                 }
             }
         }
+    }
+
+    if (showQuestionManager) {
+        QuestionManagerDialog(
+            bank = bank,
+            repository = repository,
+            onDismiss = {
+                showQuestionManager = false
+                questionCountRefresh++
+            },
+        )
     }
 }
 

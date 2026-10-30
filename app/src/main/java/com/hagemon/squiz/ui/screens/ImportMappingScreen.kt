@@ -16,14 +16,17 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.rounded.ArrowDropDown
+import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.AutoAwesome
+import androidx.compose.material.icons.rounded.Block
 import androidx.compose.material.icons.rounded.ContentCut
+import androidx.compose.material.icons.rounded.Remove
 import androidx.compose.material.icons.rounded.RemoveRedEye
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -32,6 +35,7 @@ import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.HorizontalDivider
@@ -54,6 +58,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.hagemon.squiz.data.excel.ExcelAnalyzer
@@ -84,6 +89,7 @@ fun ImportMappingScreen(
     val sheetIndex = selectedSheetIndex.coerceIn(0, (analysis.workbook.sheets.lastIndex).coerceAtLeast(0))
     val sheet = analysis.workbook.sheets.getOrNull(sheetIndex)
     val mapping = sheet?.let { selected -> mappings.firstOrNull { it.sheetName == selected.name } }
+    val includedMappings = mappings.filterNot(SheetMapping::skipImport)
 
     fun updateMapping(updated: SheetMapping) {
         onMappingsChange(mappings.map { if (it.sheetName == updated.sheetName) updated else it })
@@ -108,7 +114,9 @@ fun ImportMappingScreen(
                 Button(
                     onClick = onPreview,
                     modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 14.dp),
-                    enabled = mappings.all { ColumnField.CONTENT in it.columns && ColumnField.ANSWER in it.columns },
+                    enabled = includedMappings.isNotEmpty() && includedMappings.all {
+                        ColumnField.CONTENT in it.columns && ColumnField.ANSWER in it.columns
+                    },
                 ) {
                     Icon(Icons.Rounded.RemoveRedEye, contentDescription = null)
                     Spacer(Modifier.width(8.dp))
@@ -127,7 +135,7 @@ fun ImportMappingScreen(
                     Button(
                         onClick = onSmartParse,
                         modifier = Modifier.fillMaxWidth(),
-                        enabled = llmConfigured && !isSmartParsing,
+                        enabled = llmConfigured && includedMappings.isNotEmpty() && !isSmartParsing,
                     ) {
                         if (isSmartParsing) {
                             if (smartParseProgress == null) {
@@ -158,111 +166,148 @@ fun ImportMappingScreen(
                 }
             }
             item {
+                SectionTitle(number = 1, title = "选择 Sheet")
                 Row(
-                    Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 8.dp),
+                    Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 20.dp, vertical = 8.dp),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
                     analysis.workbook.sheets.forEachIndexed { index, item ->
+                        val skipped = mappings.firstOrNull { it.sheetName == item.name }?.skipImport == true
                         FilterChip(
                             selected = sheetIndex == index,
                             onClick = {
                                 splitColumnIndex = null
                                 selectedSheetIndex = index
                             },
-                            label = { Text(item.name, maxLines = 1) },
+                            leadingIcon = if (skipped) {
+                                { Icon(Icons.Rounded.Block, contentDescription = "不导入") }
+                            } else {
+                                null
+                            },
+                            label = {
+                                Text(
+                                    item.name,
+                                    maxLines = 1,
+                                    textDecoration = if (skipped) TextDecoration.LineThrough else TextDecoration.None,
+                                )
+                            },
                         )
                     }
                 }
-            }
-            item {
-                Text(
-                    "请选择表头所在行，并确认每一列对应的字段。无法识别的列可以保留为“不导入”。",
-                    modifier = Modifier.padding(horizontal = 20.dp, vertical = 10.dp),
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-            item {
-                ListItem(
-                    colors = ListItemDefaults.colors(containerColor = androidx.compose.ui.graphics.Color.Transparent),
-                    headlineContent = { Text("表头行") },
-                    supportingContent = { Text("当前为第 ${mapping.headerRowIndex + 1} 行") },
-                    trailingContent = {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            TextButton(
-                                onClick = {
-                                    val row = (mapping.headerRowIndex - 1).coerceAtLeast(0)
-                                    updateMapping(ExcelAnalyzer.suggestMapping(sheet, row))
-                                },
-                                enabled = mapping.headerRowIndex > 0,
-                            ) { Text("−") }
-                            Text("${mapping.headerRowIndex + 1}", style = MaterialTheme.typography.titleMedium)
-                            TextButton(
-                                onClick = {
-                                    val row = (mapping.headerRowIndex + 1).coerceAtMost(minOf(sheet.rows.lastIndex, 19))
-                                    updateMapping(ExcelAnalyzer.suggestMapping(sheet, row))
-                                },
-                                enabled = mapping.headerRowIndex < minOf(sheet.rows.lastIndex, 19),
-                            ) { Text("+") }
-                        }
+                FilledTonalButton(
+                    onClick = {
+                        splitColumnIndex = null
+                        updateMapping(mapping.copy(skipImport = !mapping.skipImport))
                     },
-                )
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 4.dp),
+                ) {
+                    Icon(Icons.Rounded.Block, contentDescription = null)
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        "不导入该页签",
+                        textDecoration = if (mapping.skipImport) TextDecoration.LineThrough else TextDecoration.None,
+                    )
+                }
+                if (mapping.skipImport) {
+                    Text(
+                        "已跳过“${sheet.name}”，不参与预览、智能解析和最终导入。再次点击上方按钮可恢复。",
+                        modifier = Modifier.padding(horizontal = 20.dp, vertical = 6.dp),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
             }
-            item {
-                MappingDropdownRow(
-                    title = "此 Sheet 的题型",
-                    value = mapping.fixedType.displayName,
-                    options = QuestionType.entries,
-                    optionLabel = QuestionType::displayName,
-                    onSelected = { updateMapping(mapping.copy(fixedType = it)) },
-                )
-            }
-            item {
-                Text(
-                    "列对应关系",
-                    modifier = Modifier.padding(start = 20.dp, top = 18.dp, end = 20.dp, bottom = 6.dp),
-                    style = MaterialTheme.typography.labelLarge,
-                    color = MaterialTheme.colorScheme.primary,
-                    fontWeight = FontWeight.SemiBold,
-                )
-            }
-            val headers = sheet.rows.getOrElse(mapping.headerRowIndex) { emptyList() }
-            itemsIndexed(headers) { columnIndex, header ->
-                val currentSplit = mapping.optionsSplit?.takeIf { it.columnIndex == columnIndex }
-                MappingDropdownRow(
-                    title = header.ifBlank { "第 ${columnIndex + 1} 列" },
-                    value = currentSplit?.let { "拆分选项 · ${it.delimiter.visibleDelimiter()}" }
-                        ?: mapping.columns.getOrElse(columnIndex) { ColumnField.NONE }.displayName,
-                    options = ColumnField.entries,
-                    optionLabel = ColumnField::displayName,
-                    onSelected = { selected ->
-                        val size = maxOf(headers.size, mapping.columns.size)
-                        val newColumns = List(size) { index ->
-                            val old = mapping.columns.getOrElse(index) { ColumnField.NONE }
-                            when {
-                                index == columnIndex -> selected
-                                selected != ColumnField.NONE && old == selected -> ColumnField.NONE
-                                else -> old
+            if (!mapping.skipImport) {
+                item {
+                    SectionTitle(number = 2, title = "选择表头行")
+                    HeaderRowStepper(
+                        selectedIndex = mapping.headerRowIndex,
+                        maximumIndex = minOf(sheet.rows.lastIndex, 19).coerceAtLeast(0),
+                        onSelected = { rowIndex -> updateMapping(ExcelAnalyzer.suggestMapping(sheet, rowIndex)) },
+                    )
+                }
+                item {
+                    SectionTitle(number = 3, title = "匹配 Excel 列")
+                    Text(
+                        "左侧是 Excel 中的列名，右侧选择导入后的字段。同名字段已自动匹配，可继续手动调整。",
+                        modifier = Modifier.padding(horizontal = 20.dp, vertical = 4.dp),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(start = 20.dp, top = 12.dp, end = 20.dp, bottom = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text("Excel 列名", modifier = Modifier.weight(1f), style = MaterialTheme.typography.labelLarge)
+                        Text("导入为", modifier = Modifier.width(132.dp), style = MaterialTheme.typography.labelLarge)
+                    }
+                }
+                val headers = sheet.rows.getOrElse(mapping.headerRowIndex) { emptyList() }
+                items(importFields, key = ColumnField::name) { field ->
+                    val selectedColumnIndex = mapping.columns.indexOf(field).takeIf { it >= 0 }
+                    SourceColumnMappingRow(
+                        headers = headers,
+                        selectedColumnIndex = selectedColumnIndex,
+                        targetLabel = field.displayName,
+                        onSelected = { newColumnIndex ->
+                            val size = maxOf(headers.size, mapping.columns.size)
+                            val newColumns = List(size) { index ->
+                                val old = mapping.columns.getOrElse(index) { ColumnField.NONE }
+                                when {
+                                    index == newColumnIndex -> field
+                                    old == field -> ColumnField.NONE
+                                    else -> old
+                                }
                             }
-                        }
-                        updateMapping(
-                            mapping.copy(
-                                columns = newColumns,
-                                optionsSplit = mapping.optionsSplit?.takeUnless { it.columnIndex == columnIndex },
-                            ),
-                        )
-                    },
-                    specialActionLabel = "拆分为多个选项…",
-                    onSpecialAction = {
-                        val values = sheet.rows.drop(mapping.headerRowIndex + 1)
-                            .map { row -> row.getOrNull(columnIndex).orEmpty() }
-                        val suggested = currentSplit?.delimiter
-                            ?: OptionTextParser.detectDelimiters(values).firstOrNull()?.delimiter
-                            ?: ""
-                        splitColumnIndex = columnIndex
-                        splitDelimiterInput = suggested.toDelimiterInput()
-                    },
-                )
+                            updateMapping(
+                                mapping.copy(
+                                    columns = newColumns,
+                                    optionsSplit = mapping.optionsSplit?.takeUnless { it.columnIndex == newColumnIndex },
+                                ),
+                            )
+                        },
+                    )
+                }
+                item {
+                    SourceColumnMappingRow(
+                        headers = headers,
+                        selectedColumnIndex = mapping.optionsSplit?.columnIndex,
+                        targetLabel = mapping.optionsSplit?.let { "拆分选项 · ${it.delimiter.visibleDelimiter()}" }
+                            ?: "拆分为多个选项",
+                        accent = true,
+                        onSelected = { columnIndex ->
+                            if (columnIndex == null) {
+                                updateMapping(mapping.copy(optionsSplit = null))
+                            } else {
+                                val values = sheet.rows.drop(mapping.headerRowIndex + 1)
+                                    .map { row -> row.getOrNull(columnIndex).orEmpty() }
+                                val suggested = mapping.optionsSplit
+                                    ?.takeIf { it.columnIndex == columnIndex }
+                                    ?.delimiter
+                                    ?: OptionTextParser.detectDelimiters(values).firstOrNull()?.delimiter
+                                    ?: ""
+                                splitColumnIndex = columnIndex
+                                splitDelimiterInput = suggested.toDelimiterInput()
+                            }
+                        },
+                    )
+                }
+                item {
+                    SectionTitle(number = 4, title = "设置默认题型（可选）")
+                    Text(
+                        "仅当这个 Sheet 没有“类型”列时使用；混合题型请保留“未指定”，并把类型列匹配为“题型”。",
+                        modifier = Modifier.padding(horizontal = 20.dp, vertical = 4.dp),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    MappingDropdownRow(
+                        title = "此 Sheet 的默认题型",
+                        value = mapping.fixedType.displayName,
+                        options = QuestionType.entries,
+                        optionLabel = QuestionType::displayName,
+                        onSelected = { updateMapping(mapping.copy(fixedType = it)) },
+                    )
+                }
             }
         }
     }
@@ -367,8 +412,75 @@ fun ImportMappingScreen(
 }
 
 @Composable
+private fun SourceColumnMappingRow(
+    headers: List<String>,
+    selectedColumnIndex: Int?,
+    targetLabel: String,
+    accent: Boolean = false,
+    onSelected: (Int?) -> Unit,
+) {
+    var expanded by remember { mutableStateOf(false) }
+    val selectedLabel = selectedColumnIndex
+        ?.let { index -> headers.getOrNull(index)?.ifBlank { "未命名列" } }
+        ?: "选择 Excel 列"
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 3.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Box(modifier = Modifier.weight(1f)) {
+            TextButton(
+                onClick = { expanded = true },
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(selectedLabel, modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Icon(Icons.Rounded.ArrowDropDown, contentDescription = null)
+            }
+            DropdownMenu(
+                expanded = expanded,
+                onDismissRequest = { expanded = false },
+                modifier = Modifier.widthIn(min = 220.dp),
+            ) {
+                DropdownMenuItem(
+                    text = { Text("不选择") },
+                    onClick = {
+                        expanded = false
+                        onSelected(null)
+                    },
+                )
+                headers.forEachIndexed { index, header ->
+                    DropdownMenuItem(
+                        text = { Text(header.ifBlank { "未命名列" }, maxLines = 1) },
+                        onClick = {
+                            expanded = false
+                            onSelected(index)
+                        },
+                    )
+                }
+            }
+        }
+        Surface(
+            modifier = Modifier.width(132.dp),
+            shape = MaterialTheme.shapes.medium,
+            color = if (accent) MaterialTheme.colorScheme.tertiaryContainer else MaterialTheme.colorScheme.surfaceContainer,
+            contentColor = if (accent) MaterialTheme.colorScheme.onTertiaryContainer else MaterialTheme.colorScheme.onSurface,
+        ) {
+            Text(
+                targetLabel,
+                modifier = Modifier.padding(horizontal = 10.dp, vertical = 10.dp),
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+                style = MaterialTheme.typography.labelLarge,
+                fontWeight = FontWeight.Medium,
+            )
+        }
+    }
+}
+
+@Composable
 private fun <T> MappingDropdownRow(
     title: String,
+    supporting: String? = null,
     value: String,
     options: List<T>,
     optionLabel: (T) -> String,
@@ -380,6 +492,9 @@ private fun <T> MappingDropdownRow(
     ListItem(
         colors = ListItemDefaults.colors(containerColor = androidx.compose.ui.graphics.Color.Transparent),
         headlineContent = { Text(title, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+        supportingContent = if (supporting == null) null else {
+            { Text(supporting, maxLines = 1, style = MaterialTheme.typography.bodySmall) }
+        },
         trailingContent = {
             Box(modifier = Modifier.widthIn(min = 124.dp)) {
                 TextButton(
@@ -427,6 +542,84 @@ private fun <T> MappingDropdownRow(
             }
         },
     )
+}
+
+private val importFields = listOf(
+    ColumnField.TYPE,
+    ColumnField.CONTENT,
+    ColumnField.OPTION_A,
+    ColumnField.OPTION_B,
+    ColumnField.OPTION_C,
+    ColumnField.OPTION_D,
+    ColumnField.OPTION_E,
+    ColumnField.OPTION_F,
+    ColumnField.OPTION_G,
+    ColumnField.ANSWER,
+    ColumnField.EXPLANATION,
+)
+
+@Composable
+private fun SectionTitle(number: Int, title: String) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(start = 20.dp, top = 18.dp, end = 20.dp, bottom = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Surface(
+            shape = androidx.compose.foundation.shape.CircleShape,
+            color = MaterialTheme.colorScheme.primaryContainer,
+            contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
+        ) {
+            Box(Modifier.size(28.dp), contentAlignment = Alignment.Center) {
+                Text(number.toString(), style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.Bold)
+            }
+        }
+        Text(title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+    }
+}
+
+@Composable
+private fun HeaderRowStepper(
+    selectedIndex: Int,
+    maximumIndex: Int,
+    onSelected: (Int) -> Unit,
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp),
+        shape = MaterialTheme.shapes.large,
+        color = MaterialTheme.colorScheme.surfaceContainerLow,
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text("表头所在行", modifier = Modifier.weight(1f), style = MaterialTheme.typography.titleSmall)
+            IconButton(
+                onClick = { onSelected((selectedIndex - 1).coerceAtLeast(0)) },
+                enabled = selectedIndex > 0,
+            ) {
+                Icon(Icons.Rounded.Remove, contentDescription = "上一行")
+            }
+            Surface(
+                shape = MaterialTheme.shapes.medium,
+                color = MaterialTheme.colorScheme.primaryContainer,
+                contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
+            ) {
+                Text(
+                    "第 ${selectedIndex + 1} 行",
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 9.dp),
+                    style = MaterialTheme.typography.labelLarge,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
+            IconButton(
+                onClick = { onSelected((selectedIndex + 1).coerceAtMost(maximumIndex)) },
+                enabled = selectedIndex < maximumIndex,
+            ) {
+                Icon(Icons.Rounded.Add, contentDescription = "下一行")
+            }
+        }
+    }
 }
 
 private val delimiterPresets = listOf(

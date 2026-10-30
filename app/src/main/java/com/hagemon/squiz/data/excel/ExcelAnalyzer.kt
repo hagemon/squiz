@@ -36,6 +36,7 @@ object ExcelAnalyzer {
         val mappingBySheet = mappings.associateBy { it.sheetName }
         return workbook.sheets.flatMap { sheet ->
             val mapping = mappingBySheet[sheet.name] ?: return@flatMap emptyList()
+            if (mapping.skipImport) return@flatMap emptyList()
             parseSheet(sheet, mapping)
         }
     }

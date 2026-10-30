@@ -23,6 +23,7 @@ import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.rememberScrollState
@@ -34,7 +35,9 @@ import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.GridView
+import androidx.compose.material.icons.rounded.AutoAwesome
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -43,6 +46,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.LocalMinimumInteractiveComponentSize
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
@@ -99,12 +103,13 @@ fun QuizScreen(
     initialPage: Int = 0,
     initialAnswers: List<PracticeAnswerSnapshot> = emptyList(),
     initialGuessedQuestionIds: Set<Long> = emptySet(),
-    guessedMarkEnabled: Boolean = true,
     reviewMode: Boolean = false,
     onLoadPage: suspend (offset: Int, limit: Int) -> List<QuizQuestion>,
     onAnswer: (question: QuizQuestion, page: Int, labels: Set<String>, isCorrect: Boolean) -> Unit = { _, _, _, _ -> },
     onPageChanged: (page: Int) -> Unit = {},
     onGuessChanged: (questionId: Long, guessed: Boolean) -> Unit = { _, _ -> },
+    llmConfigured: Boolean = false,
+    onAskLlm: suspend (question: QuizQuestion) -> String = { error("请先配置大模型接口") },
     onFinish: () -> Unit,
     onBack: () -> Unit,
 ) {
@@ -130,6 +135,9 @@ fun QuizScreen(
         }
     }
     val writtenAnswers = remember { mutableStateMapOf<Long, String>() }
+    val llmExplanations = remember { mutableStateMapOf<Long, String>() }
+    val llmExplanationErrors = remember { mutableStateMapOf<Long, String>() }
+    val llmExplanationLoading = remember { mutableStateMapOf<Long, Boolean>() }
     var guessedQuestionIds by remember(initialGuessedQuestionIds) { mutableStateOf(initialGuessedQuestionIds) }
     val loadingChunks = remember { mutableStateMapOf<Int, Boolean>() }
     val safeInitialPage = initialPage.coerceIn(0, (totalQuestionCount - 1).coerceAtLeast(0))
@@ -225,7 +233,7 @@ fun QuizScreen(
                     Column {
                         Text(bankName, maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.SemiBold)
                         Text(
-                            if (totalQuestionCount == 0) "0 / 0" else "${pagerState.currentPage + 1} / $totalQuestionCount",
+                            "已做 ${statusByPosition.size} / $totalQuestionCount",
                             style = MaterialTheme.typography.labelMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -273,10 +281,26 @@ fun QuizScreen(
                     onSubmit = { labels -> submitAnswer(question, page, labels) },
                     onNext = { goToPage(page + 1) },
                     isGuessed = question.id in guessedQuestionIds,
-                    guessedMarkEnabled = guessedMarkEnabled,
                     onGuessedChange = { guessed ->
                         guessedQuestionIds = if (guessed) guessedQuestionIds + question.id else guessedQuestionIds - question.id
                         onGuessChanged(question.id, guessed)
+                    },
+                    llmConfigured = llmConfigured,
+                    llmExplanation = llmExplanations[question.id],
+                    llmExplanationError = llmExplanationErrors[question.id],
+                    llmExplanationLoading = llmExplanationLoading[question.id] == true,
+                    onAskLlm = {
+                        if (llmExplanationLoading[question.id] == true) return@QuizQuestionPage
+                        scope.launch {
+                            llmExplanationErrors.remove(question.id)
+                            llmExplanationLoading[question.id] = true
+                            runCatching { onAskLlm(question) }
+                                .onSuccess { explanation -> llmExplanations[question.id] = explanation }
+                                .onFailure { error ->
+                                    llmExplanationErrors[question.id] = error.message ?: "大模型解析失败"
+                                }
+                            llmExplanationLoading.remove(question.id)
+                        }
                     },
                     onFinish = onFinish,
                 )
@@ -315,15 +339,18 @@ private fun QuizQuestionPage(
     onSubmit: (Set<String>) -> Unit,
     onNext: () -> Unit,
     isGuessed: Boolean,
-    guessedMarkEnabled: Boolean,
     onGuessedChange: (Boolean) -> Unit,
+    llmConfigured: Boolean,
+    llmExplanation: String?,
+    llmExplanationError: String?,
+    llmExplanationLoading: Boolean,
+    onAskLlm: () -> Unit,
     onFinish: () -> Unit,
 ) {
     val multiple = question.type == QuestionType.MULTIPLE_CHOICE
     val isChoice = question.options.isNotEmpty()
     val isCorrect = answerState.submitted && answerState.selectedLabels == question.correctLabels && question.correctLabels.isNotEmpty()
-    val supportsGuessedMark = question.type == QuestionType.SINGLE_CHOICE || question.type == QuestionType.MULTIPLE_CHOICE
-    val showGuessedMark = guessedMarkEnabled && supportsGuessedMark && (isCorrect || isGuessed)
+    val showGuessedMark = answerState.submitted || isGuessed
     val showNext = isChoice && answerState.submitted && (reviewMode || !isCorrect || !autoNext)
     val showDisabledNext = isChoice && !multiple && !autoNext && !answerState.submitted && !reviewMode && !isLastQuestion
     val showSubmit = multiple && !answerState.submitted && !reviewMode
@@ -336,10 +363,11 @@ private fun QuizQuestionPage(
                 .fillMaxSize()
                 .verticalScroll(rememberScrollState())
                 .padding(top = 24.dp, bottom = if (showAction) 112.dp else 32.dp),
-            verticalArrangement = Arrangement.spacedBy(18.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp),
         ) {
             QuestionHeading(
                 type = question.type,
+                questionNumber = question.position + 1,
                 prompt = question.prompt,
                 showGuessedMark = showGuessedMark,
                 isGuessed = isGuessed,
@@ -408,6 +436,11 @@ private fun QuizQuestionPage(
                     AnswerFeedback(
                         question = question,
                         isCorrect = isCorrect,
+                        llmConfigured = llmConfigured,
+                        llmExplanation = llmExplanation,
+                        llmExplanationError = llmExplanationError,
+                        llmExplanationLoading = llmExplanationLoading,
+                        onAskLlm = onAskLlm,
                     )
                 } else if (reviewMode) {
                     Surface(
@@ -503,6 +536,7 @@ private fun OptionSelectionControl(
 @Composable
 private fun QuestionHeading(
     type: QuestionType,
+    questionNumber: Int,
     prompt: String,
     showGuessedMark: Boolean,
     isGuessed: Boolean,
@@ -512,7 +546,7 @@ private fun QuestionHeading(
         modifier = Modifier.fillMaxWidth(),
         content = {
             Text(
-                type.displayName,
+                "${type.displayName} · 第 $questionNumber 题",
                 color = MaterialTheme.colorScheme.primary,
                 fontWeight = FontWeight.SemiBold,
             )
@@ -537,7 +571,12 @@ private fun QuestionHeading(
                     }
                 }
             }
-            Text(prompt, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Medium)
+            Text(
+                prompt,
+                modifier = Modifier.padding(end = 14.dp),
+                style = MaterialTheme.typography.titleLarge,
+                fontWeight = FontWeight.Medium,
+            )
         },
     ) { measurables, constraints ->
         val looseConstraints = constraints.copy(minWidth = 0, minHeight = 0)
@@ -567,6 +606,23 @@ private fun QuestionNavigatorDialog(
     onDismiss: () -> Unit,
     onQuestionClick: (Int) -> Unit,
 ) {
+    val groupedPages = QuestionType.entries
+        .sortedBy { it.navigatorOrder }
+        .mapNotNull { type ->
+            (0 until totalQuestionCount)
+                .filter { page -> (questionTypeByPosition[page] ?: QuestionType.UNKNOWN) == type }
+                .takeIf(List<Int>::isNotEmpty)
+                ?.let { type to it }
+        }
+    val gridState = rememberLazyGridState()
+    val currentGridItemIndex = groupedPages.navigatorItemIndex(currentPage)
+
+    LaunchedEffect(typesLoadFinished, currentGridItemIndex) {
+        if (typesLoadFinished && currentGridItemIndex >= 0) {
+            gridState.scrollToItem(currentGridItemIndex)
+        }
+    }
+
     Dialog(
         onDismissRequest = onDismiss,
         properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false),
@@ -624,16 +680,9 @@ private fun QuestionNavigatorDialog(
                                 color = MaterialTheme.colorScheme.error,
                             )
                         }
-                        val groupedPages = QuestionType.entries
-                            .sortedBy { it.navigatorOrder }
-                            .mapNotNull { type ->
-                                (0 until totalQuestionCount)
-                                    .filter { page -> (questionTypeByPosition[page] ?: QuestionType.UNKNOWN) == type }
-                                    .takeIf(List<Int>::isNotEmpty)
-                                    ?.let { type to it }
-                            }
                         LazyVerticalGrid(
                             columns = GridCells.Adaptive(50.dp),
+                            state = gridState,
                             modifier = Modifier.fillMaxSize(),
                             contentPadding = PaddingValues(start = 18.dp, top = 2.dp, end = 18.dp, bottom = 28.dp),
                             horizontalArrangement = Arrangement.spacedBy(10.dp),
@@ -717,6 +766,16 @@ private fun QuestionNavigatorDialog(
     }
 }
 
+private fun List<Pair<QuestionType, List<Int>>>.navigatorItemIndex(page: Int): Int {
+    var itemIndex = 0
+    for ((_, pages) in this) {
+        val pageIndex = pages.indexOf(page)
+        if (pageIndex >= 0) return itemIndex + 1 + pageIndex
+        itemIndex += 1 + pages.size
+    }
+    return -1
+}
+
 private val QuestionType.navigatorOrder: Int
     get() = when (this) {
         QuestionType.SINGLE_CHOICE -> 0
@@ -739,10 +798,21 @@ private fun NavigatorLegend(label: String, color: androidx.compose.ui.graphics.C
 private fun AnswerFeedback(
     question: QuizQuestion,
     isCorrect: Boolean,
+    llmConfigured: Boolean,
+    llmExplanation: String?,
+    llmExplanationError: String?,
+    llmExplanationLoading: Boolean,
+    onAskLlm: () -> Unit,
 ) {
+    val feedbackContentColor = if (isCorrect) {
+        MaterialTheme.colorScheme.onPrimaryContainer
+    } else {
+        MaterialTheme.colorScheme.onErrorContainer
+    }
     Surface(
         shape = RoundedCornerShape(20.dp),
         color = if (isCorrect) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.errorContainer,
+        contentColor = feedbackContentColor,
     ) {
         Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text(
@@ -752,6 +822,55 @@ private fun AnswerFeedback(
             )
             Text("正确答案：${question.correctAnswerText}")
             Text("解析：${question.explanation?.takeIf(String::isNotBlank) ?: "暂无"}")
+            OutlinedButton(
+                onClick = onAskLlm,
+                enabled = llmConfigured && !llmExplanationLoading,
+                modifier = Modifier.fillMaxWidth().padding(top = 2.dp),
+                colors = ButtonDefaults.outlinedButtonColors(
+                    containerColor = MaterialTheme.colorScheme.surface,
+                    contentColor = MaterialTheme.colorScheme.onSurface,
+                    disabledContainerColor = MaterialTheme.colorScheme.surfaceVariant,
+                    disabledContentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                ),
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+            ) {
+                if (llmExplanationLoading) {
+                    CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+                } else {
+                    Icon(Icons.Rounded.AutoAwesome, contentDescription = null, modifier = Modifier.size(18.dp))
+                }
+                Spacer(Modifier.width(8.dp))
+                Text(if (llmExplanationLoading) "正在生成解析…" else "问大模型")
+            }
+            if (!llmConfigured) {
+                Text(
+                    "请先在设置中配置大模型接口",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = feedbackContentColor,
+                )
+            }
+            llmExplanation?.let { explanation ->
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(14.dp),
+                    color = MaterialTheme.colorScheme.surface.copy(alpha = 0.72f),
+                ) {
+                    Column(Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text("大模型解析", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text(explanation, style = MaterialTheme.typography.bodyMedium)
+                    }
+                }
+            }
+            llmExplanationError?.let { error ->
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp),
+                    color = MaterialTheme.colorScheme.surface,
+                    contentColor = MaterialTheme.colorScheme.error,
+                ) {
+                    Text("解析失败：$error", modifier = Modifier.padding(12.dp), style = MaterialTheme.typography.bodySmall)
+                }
+            }
         }
     }
 }

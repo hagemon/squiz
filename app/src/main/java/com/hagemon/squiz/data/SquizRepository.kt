@@ -22,6 +22,7 @@ import com.hagemon.squiz.data.local.SessionQuestionWithOptions
 import com.hagemon.squiz.data.local.SquizDatabase
 import com.hagemon.squiz.data.security.ApiKeyStore
 import com.hagemon.squiz.model.AppSettings
+import com.hagemon.squiz.model.BankPracticeSettings
 import com.hagemon.squiz.model.ColorTheme
 import com.hagemon.squiz.model.LibraryItem
 import com.hagemon.squiz.model.LibraryItemType
@@ -37,6 +38,8 @@ import com.hagemon.squiz.model.QuizQuestion
 import com.hagemon.squiz.model.ThemeMode
 import com.hagemon.squiz.model.activityAt
 import java.io.IOException
+import java.text.Normalizer
+import java.util.Locale
 import java.util.UUID
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
@@ -45,6 +48,18 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.onStart
 
 private val Context.squizDataStore by preferencesDataStore(name = "squiz_preferences")
+
+data class QuestionBankMergeResult(
+    val overlappingQuestions: Int,
+    val addedQuestions: Int,
+    val mergedSessions: Int,
+    val mergedAnswers: Int,
+    val mergedWrongAnswers: Int,
+    val mergedGuessedQuestions: Int,
+) {
+    val changed: Boolean
+        get() = addedQuestions > 0 || mergedSessions > 0 || mergedAnswers > 0 || mergedGuessedQuestions > 0
+}
 
 class SquizRepository(context: Context) {
     private val dataStore = context.applicationContext.squizDataStore
@@ -244,15 +259,68 @@ class SquizRepository(context: Context) {
     suspend fun getPracticeSession(sessionId: String): PracticeSession? =
         dao.getPracticeSession(sessionId)?.toModel()
 
+    suspend fun preparePracticeSession(sessionId: String): PracticeSession? = database.withTransaction {
+        val row = dao.getPracticeSession(sessionId) ?: return@withTransaction null
+        val bank = dao.getBank(row.session.bankId) ?: return@withTransaction row.toModel()
+        val settings = bank.toPracticeSettings()
+        val mode = runCatching { PracticeMode.valueOf(row.session.mode) }.getOrDefault(PracticeMode.NORMAL)
+        val desiredOrder = desiredOrderMode(mode, settings)
+        if (row.session.orderMode != desiredOrder.name) {
+            val existingIds = dao.getSessionQuestionIds(sessionId)
+            val relations = dao.getQuestionsByIds(existingIds).associateBy { it.question.id }
+            val reorderedIds = when (desiredOrder) {
+                SessionOrderMode.TYPE_FIRST -> existingIds.sortedWith(
+                    compareBy<Long> { relations[it]?.question?.type.typeOrder }
+                        .thenBy { relations[it]?.question?.position ?: Int.MAX_VALUE },
+                )
+                SessionOrderMode.POSITION_FIRST -> existingIds.sortedBy {
+                    relations[it]?.question?.position ?: Int.MAX_VALUE
+                }
+                SessionOrderMode.SHUFFLED -> existingIds.shuffled()
+                SessionOrderMode.LEGACY -> existingIds
+            }
+            val answeredIds = dao.getAnsweredQuestionIds(sessionId).toSet()
+            val nextUnanswered = reorderedIds.indexOfFirst { it !in answeredIds }
+                .takeIf { it >= 0 }
+                ?: (reorderedIds.lastIndex).coerceAtLeast(0)
+            dao.deleteSessionQuestions(sessionId)
+            if (reorderedIds.isNotEmpty()) {
+                dao.insertSessionQuestions(
+                    reorderedIds.mapIndexed { index, questionId ->
+                        SessionQuestionEntity(sessionId, questionId, index)
+                    },
+                )
+            }
+            dao.updateSessionOrdering(
+                sessionId = sessionId,
+                currentPosition = if (row.session.completedAt == null) nextUnanswered else 0,
+                totalQuestions = reorderedIds.size,
+                orderMode = desiredOrder.name,
+            )
+        }
+        dao.getPracticeSession(sessionId)?.toModel()
+    }
+
     suspend fun createPracticeSession(
         bankId: String,
         mode: PracticeMode,
         minimumWrongCount: Int = 1,
     ): PracticeSession {
-        val questionIds = when (mode) {
-            PracticeMode.NORMAL -> dao.getQuestionIds(bankId)
-            PracticeMode.WRONG -> dao.getWrongQuestionIds(bankId, minimumWrongCount.coerceAtLeast(1))
+        val bankSettings = dao.getBank(bankId)?.toPracticeSettings() ?: BankPracticeSettings()
+        val orderMode = desiredOrderMode(mode, bankSettings)
+        val orderedQuestionIds = when (mode) {
+            PracticeMode.NORMAL -> dao.getQuestionIds(bankId, bankSettings.typeFirstOrdering)
+            PracticeMode.WRONG -> dao.getWrongQuestionIds(
+                bankId,
+                minimumWrongCount.coerceAtLeast(1),
+                bankSettings.typeFirstOrdering,
+            )
             PracticeMode.GUESSED -> dao.getGuessedQuestionIds(bankId)
+        }
+        val questionIds = if (orderMode == SessionOrderMode.SHUFFLED) {
+            orderedQuestionIds.shuffled()
+        } else {
+            orderedQuestionIds
         }
         require(questionIds.isNotEmpty()) {
             when (mode) {
@@ -270,6 +338,7 @@ class SquizRepository(context: Context) {
             completedAt = null,
             currentPosition = 0,
             totalQuestions = questionIds.size,
+            orderMode = orderMode.name,
         )
         database.withTransaction {
             dao.touchBank(bankId, now)
@@ -343,11 +412,305 @@ class SquizRepository(context: Context) {
     suspend fun getWrongQuestionCount(bankId: String, minimumWrongCount: Int): Int =
         dao.getWrongQuestionCount(bankId, minimumWrongCount.coerceAtLeast(1))
 
+    suspend fun getWrongQuestions(bankId: String, minimumWrongCount: Int = 1): List<QuizQuestion> {
+        val settings = dao.getBank(bankId)?.toPracticeSettings() ?: BankPracticeSettings()
+        val questionIds = dao.getWrongQuestionIds(
+            bankId = bankId,
+            minimumWrongCount = minimumWrongCount.coerceAtLeast(1),
+            typeFirstOrdering = settings.typeFirstOrdering,
+        )
+        if (questionIds.isEmpty()) return emptyList()
+        val relations = dao.getQuestionsByIds(questionIds).associateBy { it.question.id }
+        return questionIds.mapIndexedNotNull { index, questionId ->
+            relations[questionId]?.toQuizQuestion(position = index)
+        }
+    }
+
     suspend fun getMaximumWrongCount(bankId: String): Int = dao.getMaximumWrongCount(bankId)
 
     suspend fun getGuessedQuestionCount(bankId: String): Int = dao.getGuessedQuestionCount(bankId)
 
     suspend fun getGuessedQuestionIds(bankId: String): Set<Long> = dao.getGuessedQuestionIds(bankId).toSet()
+
+    suspend fun getVisibleQuestionCount(bankId: String): Int = dao.getVisibleQuestionCount(bankId)
+
+    suspend fun getHiddenQuestionCount(bankId: String): Int = dao.getHiddenQuestionCount(bankId)
+
+    suspend fun getBankPracticeSettings(bankId: String): BankPracticeSettings =
+        dao.getBank(bankId)?.toPracticeSettings() ?: BankPracticeSettings()
+
+    suspend fun setShuffleReviewQuestions(bankId: String, enabled: Boolean) {
+        dao.setShuffleReviewQuestions(bankId, enabled)
+    }
+
+    suspend fun setTypeFirstOrdering(bankId: String, enabled: Boolean) {
+        dao.setTypeFirstOrdering(bankId, enabled)
+    }
+
+    suspend fun setQuestionHidden(questionId: Long, hidden: Boolean) {
+        dao.setQuestionHidden(questionId, hidden)
+    }
+
+    suspend fun hideDuplicateQuestions(bankId: String): Int = database.withTransaction {
+        val seen = mutableSetOf<String>()
+        val duplicateIds = dao.getAllQuestions(bankId)
+            .asSequence()
+            .filterNot { it.question.hidden }
+            .mapNotNull { relation -> relation.question.duplicateKey()?.let { key -> relation to key } }
+            .filterNot { (_, key) -> seen.add(key) }
+            .map { (relation, _) -> relation.question.id }
+            .toList()
+        if (duplicateIds.isNotEmpty()) dao.hideQuestions(duplicateIds)
+        duplicateIds.size
+    }
+
+    suspend fun hideQuestionsDuplicatedInBanks(bankId: String, referenceBankIds: Set<String>): Int =
+        database.withTransaction {
+            val references = referenceBankIds - bankId
+            if (references.isEmpty()) return@withTransaction 0
+            val referenceKeys = dao.getQuestionsInBanks(references.toList())
+                .mapNotNullTo(hashSetOf()) { it.question.duplicateKey() }
+            val duplicateIds = dao.getAllQuestions(bankId)
+                .asSequence()
+                .filterNot { it.question.hidden }
+                .filter { it.question.duplicateKey() in referenceKeys }
+                .map { it.question.id }
+                .toList()
+            if (duplicateIds.isNotEmpty()) dao.hideQuestions(duplicateIds)
+            duplicateIds.size
+        }
+
+    suspend fun mergeQuestionBank(targetBankId: String, sourceBankId: String): QuestionBankMergeResult =
+        combineQuestionBanks(targetBankId, sourceBankId, includeMissingQuestions = true)
+
+    suspend fun crossQuestionBank(targetBankId: String, sourceBankId: String): QuestionBankMergeResult =
+        combineQuestionBanks(targetBankId, sourceBankId, includeMissingQuestions = false)
+
+    private suspend fun combineQuestionBanks(
+        targetBankId: String,
+        sourceBankId: String,
+        includeMissingQuestions: Boolean,
+    ): QuestionBankMergeResult = database.withTransaction {
+        require(targetBankId != sourceBankId) { "不能选择当前题库" }
+        requireNotNull(dao.getBank(targetBankId)) { "当前题库不存在" }
+        requireNotNull(dao.getBank(sourceBankId)) { "来源题库不存在" }
+
+        val targetQuestions = dao.getAllQuestions(targetBankId)
+        val targetQuestionIdsByKey = mutableMapOf<String, Long>()
+        targetQuestions
+            .sortedWith(
+                compareBy<QuestionWithOptions> { it.question.hidden }
+                    .thenBy { it.question.position },
+            )
+            .forEach { relation ->
+                relation.question.duplicateKey()?.let { key ->
+                    if (key !in targetQuestionIdsByKey) {
+                        targetQuestionIdsByKey[key] = relation.question.id
+                    }
+                }
+            }
+        val sourceQuestions = dao.getAllQuestions(sourceBankId)
+        val targetQuestionIdBySourceId = mutableMapOf<Long, Long>()
+        val overlappingTargetQuestionIds = mutableSetOf<Long>()
+        var nextPosition = (targetQuestions.maxOfOrNull { it.question.position } ?: -1) + 1
+        var addedQuestions = 0
+
+        sourceQuestions.forEach { relation ->
+            val duplicateKey = relation.question.duplicateKey()
+            val existingTargetQuestionId = duplicateKey?.let(targetQuestionIdsByKey::get)
+            if (existingTargetQuestionId != null) {
+                targetQuestionIdBySourceId[relation.question.id] = existingTargetQuestionId
+                overlappingTargetQuestionIds += existingTargetQuestionId
+                return@forEach
+            }
+            if (!includeMissingQuestions || relation.question.hidden) return@forEach
+
+            val questionId = dao.insertQuestion(
+                relation.question.copy(
+                    id = 0,
+                    bankId = targetBankId,
+                    position = nextPosition++,
+                    hidden = false,
+                ),
+            )
+            val options = relation.options
+                .sortedBy { it.position }
+                .map { option -> option.copy(id = 0, questionId = questionId) }
+            if (options.isNotEmpty()) dao.insertOptions(options)
+            targetQuestionIdBySourceId[relation.question.id] = questionId
+            duplicateKey?.let { targetQuestionIdsByKey[it] = questionId }
+            addedQuestions++
+        }
+
+        val targetSessionsByOrigin = dao.getPracticeSessionEntities(targetBankId)
+            .associateByTo(mutableMapOf()) { it.originSessionId ?: it.id }
+        val targetSessionQuestions = dao.getSessionQuestionEntities(targetBankId)
+            .groupBy(SessionQuestionEntity::sessionId)
+            .mapValuesTo(mutableMapOf()) { (_, rows) -> rows.toMutableList() }
+        val targetAnswers = dao.getPracticeAnswerEntities(targetBankId)
+            .groupBy(PracticeAnswerEntity::sessionId)
+            .mapValuesTo(mutableMapOf()) { (_, answers) -> answers.toMutableList() }
+        val sourceSessions = dao.getPracticeSessionEntities(sourceBankId)
+        val sourceSessionQuestions = dao.getSessionQuestionEntities(sourceBankId)
+            .groupBy(SessionQuestionEntity::sessionId)
+        val sourceAnswers = dao.getPracticeAnswerEntities(sourceBankId)
+            .groupBy(PracticeAnswerEntity::sessionId)
+        val targetSessionIdBySourceSessionId = mutableMapOf<String, String>()
+        var mergedSessions = 0
+        var mergedAnswers = 0
+        var mergedWrongAnswers = 0
+
+        sourceSessions.forEach { sourceSession ->
+            val sourceQuestionRows = sourceSessionQuestions[sourceSession.id].orEmpty()
+            val seenMappedQuestionIds = mutableSetOf<Long>()
+            val mappedQuestionIds = sourceQuestionRows.mapNotNull { sourceRow ->
+                val targetQuestionId = targetQuestionIdBySourceId[sourceRow.questionId]
+                    ?: return@mapNotNull null
+                if (!seenMappedQuestionIds.add(targetQuestionId)) return@mapNotNull null
+                targetQuestionId
+            }
+            if (mappedQuestionIds.isEmpty()) return@forEach
+
+            val originSessionId = sourceSession.originSessionId ?: sourceSession.id
+            val existingTargetSession = targetSessionsByOrigin[originSessionId]
+            val targetSessionId = existingTargetSession?.id
+                ?: mergedPracticeSessionId(targetBankId, originSessionId)
+            val existingQuestionRows = targetSessionQuestions[targetSessionId].orEmpty()
+            val existingQuestionIds = existingQuestionRows.mapTo(mutableSetOf(), SessionQuestionEntity::questionId)
+            val newQuestionIds = mappedQuestionIds.filterNot(existingQuestionIds::contains)
+            var sessionMetadataChanged = false
+
+            var targetSession = existingTargetSession
+            if (targetSession == null) {
+                val sourceCurrentQuestionId = sourceQuestionRows
+                    .firstOrNull { it.orderIndex == sourceSession.currentPosition }
+                    ?.questionId
+                val targetCurrentQuestionId = sourceCurrentQuestionId?.let(targetQuestionIdBySourceId::get)
+                val targetCurrentPosition = targetCurrentQuestionId
+                    ?.let(mappedQuestionIds::indexOf)
+                    ?.takeIf { it >= 0 }
+                    ?: sourceSession.currentPosition.coerceIn(0, mappedQuestionIds.lastIndex)
+                targetSession = sourceSession.copy(
+                    id = targetSessionId,
+                    bankId = targetBankId,
+                    currentPosition = targetCurrentPosition,
+                    totalQuestions = mappedQuestionIds.size,
+                    originSessionId = originSessionId,
+                )
+                dao.insertPracticeSession(targetSession)
+                val insertedRows = mappedQuestionIds.mapIndexed { index, questionId ->
+                    SessionQuestionEntity(targetSessionId, questionId, index)
+                }
+                dao.insertSessionQuestions(insertedRows)
+                targetSessionQuestions[targetSessionId] = insertedRows.toMutableList()
+            } else if (newQuestionIds.isNotEmpty()) {
+                val nextOrderIndex = (existingQuestionRows.maxOfOrNull { it.orderIndex } ?: -1) + 1
+                val insertedRows = newQuestionIds.mapIndexed { index, questionId ->
+                    SessionQuestionEntity(targetSessionId, questionId, nextOrderIndex + index)
+                }
+                dao.insertSessionQuestions(insertedRows)
+                val totalQuestions = existingQuestionRows.size + insertedRows.size
+                val completedAt = targetSession.completedAt ?: sourceSession.completedAt
+                val currentPosition = if (completedAt != null) {
+                    totalQuestions - 1
+                } else {
+                    targetSession.currentPosition.coerceIn(0, totalQuestions - 1)
+                }
+                dao.updateMergedPracticeSession(
+                    sessionId = targetSessionId,
+                    currentPosition = currentPosition,
+                    totalQuestions = totalQuestions,
+                    completedAt = completedAt,
+                )
+                targetSession = targetSession.copy(
+                    currentPosition = currentPosition,
+                    totalQuestions = totalQuestions,
+                    completedAt = completedAt,
+                )
+                targetSessionQuestions.getOrPut(targetSessionId, ::mutableListOf).addAll(insertedRows)
+                sessionMetadataChanged = true
+            }
+
+            val existingAnswerQuestionIds = targetAnswers[targetSessionId]
+                .orEmpty()
+                .mapTo(mutableSetOf(), PracticeAnswerEntity::questionId)
+            val mappedAnswers = sourceAnswers[sourceSession.id]
+                .orEmpty()
+                .mapNotNull { sourceAnswer ->
+                    targetQuestionIdBySourceId[sourceAnswer.questionId]?.let { targetQuestionId ->
+                        targetQuestionId to sourceAnswer
+                    }
+                }
+                .groupBy { it.first }
+                .map { (targetQuestionId, answers) ->
+                    answers.maxBy { it.second.answeredAt }.second.copy(
+                        sessionId = targetSessionId,
+                        questionId = targetQuestionId,
+                    )
+                }
+                .filterNot { it.questionId in existingAnswerQuestionIds }
+            if (mappedAnswers.isNotEmpty()) {
+                dao.insertPracticeAnswers(mappedAnswers)
+                targetAnswers.getOrPut(targetSessionId, ::mutableListOf).addAll(mappedAnswers)
+            }
+
+            if (existingTargetSession != null && targetSession?.completedAt == null && sourceSession.completedAt != null) {
+                val completedPosition = targetSession.totalQuestions - 1
+                dao.updateMergedPracticeSession(
+                    sessionId = targetSessionId,
+                    currentPosition = completedPosition,
+                    totalQuestions = targetSession.totalQuestions,
+                    completedAt = sourceSession.completedAt,
+                )
+                targetSession = targetSession.copy(
+                    currentPosition = completedPosition,
+                    completedAt = sourceSession.completedAt,
+                )
+                sessionMetadataChanged = true
+            }
+
+            if (existingTargetSession == null || newQuestionIds.isNotEmpty() || mappedAnswers.isNotEmpty() || sessionMetadataChanged) {
+                mergedSessions++
+            }
+            mergedAnswers += mappedAnswers.size
+            mergedWrongAnswers += mappedAnswers.count { !it.isCorrect }
+            targetSessionIdBySourceSessionId[sourceSession.id] = targetSessionId
+            targetSessionsByOrigin[originSessionId] = requireNotNull(targetSession)
+        }
+
+        val targetGuessedQuestionIds = dao.getGuessedQuestionEntities(targetBankId)
+            .mapTo(mutableSetOf(), GuessedQuestionEntity::questionId)
+        var mergedGuessedQuestions = 0
+        dao.getGuessedQuestionEntities(sourceBankId).forEach { sourceGuessed ->
+            val targetQuestionId = targetQuestionIdBySourceId[sourceGuessed.questionId]
+                ?: return@forEach
+            val targetSessionId = targetSessionIdBySourceSessionId[sourceGuessed.sessionId]
+                ?: return@forEach
+            if (!targetGuessedQuestionIds.add(targetQuestionId)) return@forEach
+            dao.upsertGuessedQuestion(
+                sourceGuessed.copy(
+                    questionId = targetQuestionId,
+                    sessionId = targetSessionId,
+                ),
+            )
+            mergedGuessedQuestions++
+        }
+
+        val result = QuestionBankMergeResult(
+            overlappingQuestions = overlappingTargetQuestionIds.size,
+            addedQuestions = addedQuestions,
+            mergedSessions = mergedSessions,
+            mergedAnswers = mergedAnswers,
+            mergedWrongAnswers = mergedWrongAnswers,
+            mergedGuessedQuestions = mergedGuessedQuestions,
+        )
+        if (addedQuestions > 0) {
+            dao.refreshBankQuestionCount(targetBankId, System.currentTimeMillis())
+        } else if (result.changed) {
+            dao.touchBank(targetBankId, System.currentTimeMillis())
+        }
+        result
+    }
 
     suspend fun setQuestionGuessed(sessionId: String, questionId: Long, guessed: Boolean) {
         if (guessed) {
@@ -407,10 +770,43 @@ private fun QuestionWithOptions.toQuizQuestion(position: Int = question.position
     answer = question.answer,
     explanation = question.explanation,
     sheetName = question.sheetName,
+    hidden = question.hidden,
 )
 
 private fun SessionQuestionWithOptions.toQuizQuestion(): QuizQuestion =
     QuestionWithOptions(question, options).toQuizQuestion(practicePosition)
+
+private fun QuestionBankEntity.toPracticeSettings(): BankPracticeSettings = BankPracticeSettings(
+    shuffleReviewQuestions = shuffleReviewQuestions,
+    typeFirstOrdering = typeFirstOrdering,
+)
+
+private fun desiredOrderMode(mode: PracticeMode, settings: BankPracticeSettings): SessionOrderMode = when (mode) {
+    PracticeMode.NORMAL -> if (settings.typeFirstOrdering) SessionOrderMode.TYPE_FIRST else SessionOrderMode.POSITION_FIRST
+    PracticeMode.WRONG -> when {
+        settings.shuffleReviewQuestions -> SessionOrderMode.SHUFFLED
+        settings.typeFirstOrdering -> SessionOrderMode.TYPE_FIRST
+        else -> SessionOrderMode.POSITION_FIRST
+    }
+    PracticeMode.GUESSED -> if (settings.shuffleReviewQuestions) SessionOrderMode.SHUFFLED else SessionOrderMode.POSITION_FIRST
+}
+
+private enum class SessionOrderMode {
+    LEGACY,
+    TYPE_FIRST,
+    POSITION_FIRST,
+    SHUFFLED,
+}
+
+private val String?.typeOrder: Int
+    get() = when (this) {
+        QuestionType.SINGLE_CHOICE.name -> 0
+        QuestionType.MULTIPLE_CHOICE.name -> 1
+        QuestionType.TRUE_FALSE.name -> 2
+        QuestionType.CALCULATION.name -> 3
+        QuestionType.SHORT_ANSWER.name -> 4
+        else -> 5
+    }
 
 private fun com.hagemon.squiz.data.local.PracticeSessionSummaryRow.toModel(): PracticeSession = PracticeSession(
     id = session.id,
@@ -431,3 +827,24 @@ private val androidx.datastore.core.DataStore<Preferences>.safeData: Flow<Prefer
 
 private inline fun <reified T : Enum<T>> String?.toEnumOrDefault(default: T): T =
     this?.let { value -> enumValues<T>().firstOrNull { it.name == value } } ?: default
+
+private fun mergedPracticeSessionId(targetBankId: String, originSessionId: String): String =
+    UUID.nameUUIDFromBytes("squiz-merge:$targetBankId:$originSessionId".toByteArray()).toString()
+
+private fun QuestionEntity.duplicateKey(): String? {
+    val normalizedPrompt = prompt.normalizedForDuplicate()
+    val normalizedAnswer = answer.normalizedForDuplicate().let { value ->
+        if (type == QuestionType.SINGLE_CHOICE.name || type == QuestionType.MULTIPLE_CHOICE.name) {
+            value.replace(Regex("[\\s,，;；、/|]+"), "")
+        } else {
+            value
+        }
+    }
+    if (normalizedPrompt.isBlank() || normalizedAnswer.isBlank()) return null
+    return "$normalizedPrompt\u0000$normalizedAnswer"
+}
+
+private fun String.normalizedForDuplicate(): String = Normalizer.normalize(this, Normalizer.Form.NFKC)
+    .trim()
+    .lowercase(Locale.ROOT)
+    .replace(Regex("\\s+"), " ")
